@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -58,6 +58,10 @@ SUI_USER_TYPES = {
 
 
 class MigrationError(RuntimeError):
+    pass
+
+
+class MasterSyncUnavailable(MigrationError):
     pass
 
 
@@ -958,10 +962,48 @@ def port_conflict_guidance(conflicts: dict[int, str]) -> str:
         [
             f"3. 确认端口已释放（命令无输出才算成功）：ss -H -lntup | grep -E ':({ports})([[:space:]]|$)'",
             "4. 回到 s-x 菜单，重新选择 5 执行正式迁移。",
+            "也可以重新选择 5，并在询问是否自动停止来源服务时输入 y。",
             "不要使用 --allow-active-port 绕过同端口检查。",
         ]
     )
     return "\n".join(lines)
+
+
+def source_service_for_owner(owner: str) -> str | None:
+    normalized = owner.strip().lower()
+    if normalized in {"sui", "s-ui"} or "s-ui" in normalized:
+        return "s-ui"
+    if "sing-box" in normalized or "singbox" in normalized:
+        return "sing-box"
+    return None
+
+
+def source_services_for_conflicts(conflicts: dict[int, str]) -> list[str]:
+    services: set[str] = set()
+    unknown: list[str] = []
+    for port, owner in sorted(conflicts.items()):
+        service = source_service_for_owner(owner)
+        if service:
+            services.add(service)
+        else:
+            unknown.append(f"{port}({owner})")
+    if unknown:
+        raise MigrationError(
+            "refusing to stop unrecognized port owner(s) automatically: " + ", ".join(unknown)
+        )
+    return sorted(services)
+
+
+def wait_for_ports_released(ports: set[int], timeout: int = 12) -> dict[int, str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        active = listening_port_owners()
+        remaining = {port: active[port] for port in ports if port in active}
+        if not remaining:
+            return {}
+        time.sleep(0.5)
+    active = listening_port_owners()
+    return {port: active[port] for port in ports if port in active}
 
 
 def wait_for_ports(ports: set[int], timeout: int = 12) -> set[int]:
@@ -973,6 +1015,36 @@ def wait_for_ports(ports: set[int], timeout: int = 12) -> set[int]:
             return set()
         time.sleep(0.5)
     return ports - set(listening_port_owners())
+
+
+def post_migration_guidance(*, sync_confirmed: bool, stopped_services: Iterable[str] = ()) -> str:
+    lines = ["", "miaomiaowuX 后续操作："]
+    if sync_confirmed:
+        lines.extend(
+            [
+                "1. 主控已确认节点同步，打开「节点管理」找到迁移后的节点。",
+                "2. 使用 TCPing 检查延迟，再用客户端验证连接。",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "1. 打开「服务管理」，找到当前这台 Agent 服务器（例如 RN）。",
+                "2. 点击「扫描远程服务」。",
+                "3. 扫描完成后点击「接受 Agent 现状」。",
+                "4. 打开「节点管理」确认节点出现，并使用 TCPing 检查延迟。",
+            ]
+        )
+    stopped = sorted(set(stopped_services))
+    if stopped:
+        joined = ", ".join(stopped)
+        lines.extend(
+            [
+                f"脚本已停止来源服务：{joined}。",
+                "脚本没有修改其开机启动状态；确认迁移无误后，如不再使用旧 Core，请自行禁用对应服务，避免重启后再次占用端口。",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def wait_for_scan_result(started_at: dt.datetime, expected_count: int, timeout: int = 25) -> bool:
@@ -1076,9 +1148,9 @@ def request_master_node_sync(
     except urllib.error.HTTPError as exc:
         detail = exc.read(16_384).decode("utf-8", errors="replace").strip()
         if exc.code == 404:
-            raise MigrationError(
-                "the master does not provide /api/remote/sync-nodes; upgrade miaomiaowuX "
-                "before using --notify-master"
+            raise MasterSyncUnavailable(
+                "the current master does not provide the Agent sync API "
+                "/api/remote/sync-nodes"
             ) from exc
         raise MigrationError(f"master node sync returned HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
@@ -1218,14 +1290,21 @@ def command_deploy(args: argparse.Namespace) -> int:
         raise MigrationError("deploy --apply must run as root")
 
     desired_ports = {int(inbound["port"]) for inbound in result.inbounds}
+    source_services: list[str] = []
     if not args.allow_active_port:
         active = listening_port_owners()
         conflicts = {port: active[port] for port in desired_ports if port in active and active[port] != "xray"}
         if conflicts:
-            raise MigrationError(port_conflict_guidance(conflicts))
+            if not args.stop_source_services:
+                raise MigrationError(port_conflict_guidance(conflicts))
+            try:
+                source_services = source_services_for_conflicts(conflicts)
+            except MigrationError as exc:
+                raise MigrationError(f"{exc}\n{port_conflict_guidance(conflicts)}") from exc
 
     config_stat = config_path.stat()
     backup = backup_config(config_path)
+    stopped_source_services: list[str] = []
     state = {
         "version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1238,11 +1317,26 @@ def command_deploy(args: argparse.Namespace) -> int:
         "agent_config": args.agent_config,
         "deployed_tags": [item["tag"] for item in result.inbounds],
         "deployed_ports": sorted(desired_ports),
+        "source_services_to_stop": source_services,
         "status": "deploying",
     }
     write_state(Path(args.state_file), state)
 
     try:
+        for service in source_services:
+            was_active = service_active(service)
+            log("ACTION", f"stopping source service {service} to release migrated port(s)")
+            if was_active:
+                stopped_source_services.append(service)
+            service_action(service, "stop")
+        if source_services:
+            remaining_conflicts = wait_for_ports_released(desired_ports)
+            if remaining_conflicts:
+                raise MigrationError(port_conflict_guidance(remaining_conflicts))
+            state["stopped_source_services"] = stopped_source_services
+            write_state(Path(args.state_file), state)
+            log("OK", "source service stopped and target port(s) released")
+
         atomic_write(
             config_path,
             json_text(merged),
@@ -1260,13 +1354,22 @@ def command_deploy(args: argparse.Namespace) -> int:
             )
     except Exception as exc:
         log("ERROR", f"deployment failed, restoring {backup}")
+        recovery_errors: list[str] = []
         try:
             restore_backup(config_path, backup, args.xray_service)
             state["status"] = "auto_rolled_back"
             state["error"] = str(exc)
-            write_state(Path(args.state_file), state)
         except Exception as rollback_exc:
-            raise MigrationError(f"deployment failed: {exc}; automatic rollback also failed: {rollback_exc}") from exc
+            recovery_errors.append(f"automatic Xray rollback failed: {rollback_exc}")
+        for service in reversed(stopped_source_services):
+            try:
+                service_action(service, "start")
+                log("OK", f"restarted source service {service} after deployment failure")
+            except MigrationError as restart_exc:
+                recovery_errors.append(f"failed to restart {service}: {restart_exc}")
+        write_state(Path(args.state_file), state)
+        if recovery_errors:
+            raise MigrationError(f"deployment failed: {exc}; {'; '.join(recovery_errors)}") from exc
         raise MigrationError(f"deployment failed and was rolled back: {exc}") from exc
 
     state["status"] = "deployed"
@@ -1294,10 +1397,28 @@ def command_deploy(args: argparse.Namespace) -> int:
                 expected_tags=state["deployed_tags"],
                 timeout=args.master_sync_timeout,
             )
+        except MasterSyncUnavailable as exc:
+            state["status"] = "manual_sync_required"
+            state["master_sync_error"] = str(exc)
+            write_state(Path(args.state_file), state)
+            log("WARN", "Xray migration and Agent scan succeeded; this master requires manual acceptance")
+            print(
+                post_migration_guidance(
+                    sync_confirmed=False, stopped_services=stopped_source_services
+                ),
+                file=sys.stderr,
+            )
+            return 0
         except MigrationError as exc:
             state["status"] = "master_sync_failed"
             state["master_sync_error"] = str(exc)
             write_state(Path(args.state_file), state)
+            print(
+                post_migration_guidance(
+                    sync_confirmed=False, stopped_services=stopped_source_services
+                ),
+                file=sys.stderr,
+            )
             raise MigrationError(f"Xray and Agent are healthy, but node sync was not confirmed: {exc}") from exc
         state["status"] = "synced"
         state["synced_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -1307,6 +1428,21 @@ def command_deploy(args: argparse.Namespace) -> int:
         state.pop("master_sync_error", None)
         write_state(Path(args.state_file), state)
         log("OK", f"master confirmed node tag(s): {', '.join(state['deployed_tags'])}")
+        print(
+            post_migration_guidance(
+                sync_confirmed=True, stopped_services=stopped_source_services
+            ),
+            file=sys.stderr,
+        )
+    else:
+        state["status"] = "manual_sync_required"
+        write_state(Path(args.state_file), state)
+        print(
+            post_migration_guidance(
+                sync_confirmed=False, stopped_services=stopped_source_services
+            ),
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -1325,9 +1461,26 @@ def command_rollback(args: argparse.Namespace) -> int:
     agent_service = args.agent_service or state.get("agent_service", "mmw-agent")
     agent_config = args.agent_config or state.get("agent_config", DEFAULT_AGENT_CONFIG)
     deployed_tags = [tag for tag in state.get("deployed_tags", []) if isinstance(tag, str) and tag]
+    stopped_source_services = [
+        service
+        for service in state.get("stopped_source_services", [])
+        if service in {"s-ui", "sing-box"}
+    ]
     restore_backup(config_path, backup_path, xray_service)
+    for service in stopped_source_services:
+        try:
+            service_action(service, "start")
+        except MigrationError as exc:
+            state["status"] = "rolled_back_source_restart_failed"
+            state["rollback_error"] = str(exc)
+            write_state(state_path, state)
+            raise MigrationError(
+                f"Xray backup was restored, but source service {service} could not be restarted: {exc}"
+            ) from exc
+        log("OK", f"restarted source service {service} after rollback")
     state["status"] = "rolled_back"
     state["rolled_back_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    state["restarted_source_services"] = stopped_source_services
     write_state(state_path, state)
     log("OK", f"restored Xray config from {backup_path}")
     if args.notify_master:
@@ -1404,7 +1557,7 @@ singbox_to_xray {VERSION}
   2. 安全预检（推荐，不写入）
   3. 选择数据源后预检
   4. 隔离端口预检
-  5. 正式迁移到 Xray
+  5. 正式迁移到 Xray（可自动停止旧 Core）
   6. 回滚最近一次迁移
   7. 显示命令帮助
   0. 退出
@@ -1441,15 +1594,21 @@ singbox_to_xray {VERSION}
             elif choice == "5":
                 print(
                     "\n正式迁移会备份并写入 Xray 配置，然后重启 Xray。\n"
-                    "请先停止旧 Core 并确认目标端口已释放。"
+                    "如果旧 Core 占用目标端口，脚本可以在确认后停止对应服务。"
                 )
                 if menu_prompt("输入 APPLY 继续，其他内容取消：") != "APPLY":
                     print("已取消正式迁移。")
                     continue
                 command = ["deploy", "--interactive", "--strict", "--apply"]
+                if menu_prompt(
+                    "端口被 s-ui/sing-box 占用时，由脚本自动停止对应服务？[y/N]："
+                ).lower() in {"y", "yes"}:
+                    command.append("--stop-source-services")
                 if menu_prompt("替换 Xray 中同 tag 入站？[y/N]：").lower() in {"y", "yes"}:
                     command.append("--replace-existing")
-                if menu_prompt("迁移后通知 miaomiaowuX 主控？[y/N]：").lower() in {"y", "yes"}:
+                if menu_prompt(
+                    "尝试自动通知 miaomiaowuX 主控？不支持时会提示手动同步。[y/N]："
+                ).lower() in {"y", "yes"}:
                     command.append("--notify-master")
                 run_menu_action(command)
             elif choice == "6":
@@ -1541,6 +1700,11 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--output", help="write the merged preview to this path")
     deploy_parser.add_argument("--skip-xray-test", action="store_true", help="preview only; forbidden with --apply")
     deploy_parser.add_argument("--apply", action="store_true", help="write and restart Xray")
+    deploy_parser.add_argument(
+        "--stop-source-services",
+        action="store_true",
+        help="stop recognized s-ui/sing-box services when they own migrated ports",
+    )
     deploy_parser.add_argument(
         "--notify-master",
         action="store_true",

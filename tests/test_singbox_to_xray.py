@@ -218,6 +218,21 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         action.assert_not_called()
 
+    def test_menu_apply_can_stop_source_services(self):
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin,
+            "readline",
+            side_effect=["5\n", "APPLY\n", "y\n", "n\n", "n\n", "0\n"],
+        ), mock.patch.object(converter, "run_menu_action", return_value=0) as action, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            exit_code = converter.command_menu(argparse.Namespace())
+
+        self.assertEqual(exit_code, 0)
+        action.assert_called_once_with(
+            ["deploy", "--interactive", "--strict", "--apply", "--stop-source-services"]
+        )
+
     def test_port_conflict_guidance_for_embedded_sui(self):
         message = converter.port_conflict_guidance({50965: "sui"})
 
@@ -225,6 +240,7 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("systemctl stop s-ui", message)
         self.assertIn("面板会暂时离线", message)
         self.assertIn("重新选择 5", message)
+        self.assertIn("自动停止来源服务", message)
         self.assertIn("不要使用 --allow-active-port", message)
 
     def test_port_conflict_guidance_for_standalone_singbox(self):
@@ -233,6 +249,256 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("systemctl status sing-box", message)
         self.assertIn("systemctl stop sing-box", message)
         self.assertIn(":(443)([[:space:]]|$)", message)
+
+    def test_source_services_only_accept_known_port_owners(self):
+        self.assertEqual(
+            converter.source_services_for_conflicts({443: "sui", 8443: "sing-box"}),
+            ["s-ui", "sing-box"],
+        )
+        with self.assertRaisesRegex(converter.MigrationError, "unrecognized"):
+            converter.source_services_for_conflicts({443: "nginx"})
+
+    def test_post_migration_guidance_describes_manual_acceptance(self):
+        message = converter.post_migration_guidance(
+            sync_confirmed=False, stopped_services=["s-ui"]
+        )
+
+        self.assertIn("服务管理", message)
+        self.assertIn("扫描远程服务", message)
+        self.assertIn("接受 Agent 现状", message)
+        self.assertIn("节点管理", message)
+        self.assertIn("TCPing", message)
+        self.assertIn("没有修改其开机启动状态", message)
+
+    def test_deploy_stops_sui_and_prints_manual_sync_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sing-box.json"
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "type": "shadowsocks",
+                                "tag": "ss-main",
+                                "listen_port": 12315,
+                                "method": "aes-128-gcm",
+                                "password": "secret",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            xray_config.write_text('{"inbounds": []}\n', encoding="utf-8")
+            args = converter.build_parser().parse_args(
+                [
+                    "deploy",
+                    "--input",
+                    str(source),
+                    "--xray-config",
+                    str(xray_config),
+                    "--state-file",
+                    str(state_file),
+                    "--strict",
+                    "--apply",
+                    "--stop-source-services",
+                ]
+            )
+            stderr = io.StringIO()
+            with mock.patch.object(converter, "validate_xray_config"), mock.patch.object(
+                converter.os, "geteuid", return_value=0
+            ), mock.patch.object(converter.os, "chown"), mock.patch.object(
+                converter, "listening_port_owners", side_effect=[{12315: "sui"}, {}]
+            ), mock.patch.object(converter, "service_active", return_value=True), mock.patch.object(
+                converter, "service_action"
+            ) as service_action, mock.patch.object(
+                converter, "wait_for_ports", return_value=set()
+            ), contextlib.redirect_stderr(stderr):
+                exit_code = converter.command_deploy(args)
+
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(state["status"], "manual_sync_required")
+        self.assertEqual(state["stopped_source_services"], ["s-ui"])
+        service_action.assert_any_call("s-ui", "stop")
+        service_action.assert_any_call("xray", "restart")
+        self.assertNotIn(mock.call("s-ui", "start"), service_action.call_args_list)
+        self.assertIn("接受 Agent 现状", stderr.getvalue())
+
+    def test_deploy_restarts_stopped_source_service_after_xray_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sing-box.json"
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            original = '{"inbounds": []}\n'
+            source.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "type": "shadowsocks",
+                                "tag": "ss-main",
+                                "listen_port": 12315,
+                                "method": "aes-128-gcm",
+                                "password": "secret",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            xray_config.write_text(original, encoding="utf-8")
+            args = converter.build_parser().parse_args(
+                [
+                    "deploy",
+                    "--input",
+                    str(source),
+                    "--xray-config",
+                    str(xray_config),
+                    "--state-file",
+                    str(state_file),
+                    "--strict",
+                    "--apply",
+                    "--stop-source-services",
+                ]
+            )
+            calls: list[tuple[str, str]] = []
+            xray_restarts = 0
+
+            def service_action(service, action):
+                nonlocal xray_restarts
+                calls.append((service, action))
+                if service == "xray" and action == "restart":
+                    xray_restarts += 1
+                    if xray_restarts == 1:
+                        raise converter.MigrationError("simulated Xray restart failure")
+
+            with mock.patch.object(converter, "validate_xray_config"), mock.patch.object(
+                converter.os, "geteuid", return_value=0
+            ), mock.patch.object(converter.os, "chown"), mock.patch.object(
+                converter, "listening_port_owners", side_effect=[{12315: "sui"}, {}]
+            ), mock.patch.object(converter, "service_active", return_value=True), mock.patch.object(
+                converter, "service_action", side_effect=service_action
+            ), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(converter.MigrationError, "rolled back"):
+                    converter.command_deploy(args)
+
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            restored = xray_config.read_text(encoding="utf-8")
+
+        self.assertEqual(state["status"], "auto_rolled_back")
+        self.assertEqual(restored, original)
+        self.assertIn(("s-ui", "stop"), calls)
+        self.assertIn(("s-ui", "start"), calls)
+
+    def test_deploy_treats_missing_master_api_as_manual_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sing-box.json"
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "type": "shadowsocks",
+                                "tag": "ss-main",
+                                "listen_port": 12315,
+                                "method": "aes-128-gcm",
+                                "password": "secret",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            xray_config.write_text('{"inbounds": []}\n', encoding="utf-8")
+            args = converter.build_parser().parse_args(
+                [
+                    "deploy",
+                    "--input",
+                    str(source),
+                    "--xray-config",
+                    str(xray_config),
+                    "--state-file",
+                    str(state_file),
+                    "--strict",
+                    "--apply",
+                    "--notify-master",
+                ]
+            )
+            stderr = io.StringIO()
+            with mock.patch.object(converter, "validate_xray_config"), mock.patch.object(
+                converter.os, "geteuid", return_value=0
+            ), mock.patch.object(converter.os, "chown"), mock.patch.object(
+                converter, "listening_port_owners", return_value={}
+            ), mock.patch.object(converter, "service_active", return_value=True), mock.patch.object(
+                converter, "service_action"
+            ), mock.patch.object(converter, "wait_for_ports", return_value=set()), mock.patch.object(
+                converter, "wait_for_scan_result", return_value=True
+            ), mock.patch.object(
+                converter,
+                "request_master_node_sync",
+                side_effect=converter.MasterSyncUnavailable("missing Agent sync API"),
+            ), contextlib.redirect_stderr(stderr):
+                exit_code = converter.command_deploy(args)
+
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(state["status"], "manual_sync_required")
+        self.assertIn("requires manual acceptance", stderr.getvalue())
+        self.assertIn("接受 Agent 现状", stderr.getvalue())
+
+    def test_rollback_restarts_source_service_stopped_by_deploy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xray_config = root / "xray.json"
+            backup = root / "xray.backup.json"
+            state_file = root / "state.json"
+            xray_config.write_text(
+                '{"inbounds": [{"tag": "ss-main", "port": 12315}]}\n', encoding="utf-8"
+            )
+            backup.write_text('{"inbounds": []}\n', encoding="utf-8")
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "xray_config": str(xray_config),
+                        "backup": str(backup),
+                        "xray_service": "xray",
+                        "agent_service": "mmw-agent",
+                        "agent_config": "/etc/mmw-agent/config.yaml",
+                        "deployed_tags": ["ss-main"],
+                        "stopped_source_services": ["s-ui"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = converter.build_parser().parse_args(
+                ["rollback", "--state-file", str(state_file)]
+            )
+            with mock.patch.object(converter.os, "geteuid", return_value=0), mock.patch.object(
+                converter.os, "chown"
+            ), mock.patch.object(converter, "service_active", return_value=True), mock.patch.object(
+                converter, "service_action"
+            ) as service_action, contextlib.redirect_stderr(io.StringIO()):
+                exit_code = converter.command_rollback(args)
+
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            restored = json.loads(xray_config.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(restored, {"inbounds": []})
+        self.assertEqual(state["status"], "rolled_back")
+        self.assertEqual(state["restarted_source_services"], ["s-ui"])
+        service_action.assert_any_call("xray", "restart")
+        service_action.assert_any_call("s-ui", "start")
 
     def test_converts_shadowsocks_and_socks(self):
         source = {
@@ -573,7 +839,7 @@ class ConverterTests(unittest.TestCase):
                         config, expected_tags=["ss-main", "socks-main"]
                     )
 
-    def test_request_master_node_sync_explains_old_master(self):
+    def test_request_master_node_sync_marks_manual_sync_required(self):
         error = urllib.error.HTTPError(
             "https://master.example.com/api/remote/sync-nodes",
             404,
@@ -588,7 +854,7 @@ class ConverterTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with mock.patch.object(converter.urllib.request, "urlopen", side_effect=error):
-                with self.assertRaisesRegex(converter.MigrationError, "upgrade miaomiaowuX"):
+                with self.assertRaisesRegex(converter.MasterSyncUnavailable, "Agent sync API"):
                     converter.request_master_node_sync(config, expected_tags=["ss-main"])
 
 
