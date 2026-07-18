@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import copy
 import io
 import json
@@ -154,6 +155,68 @@ class ConverterTests(unittest.TestCase):
             selected = converter.choose_source(candidates, interactive=True)
 
         self.assertEqual(selected.kind, "json")
+
+    def test_inspect_lists_metadata_without_credentials(self):
+        source = converter.SourceDocument(
+            {
+                "inbounds": [
+                    {
+                        "type": "vless",
+                        "tag": "vless-main",
+                        "listen_port": 443,
+                        "users": [
+                            {
+                                "uuid": "11111111-2222-3333-4444-555555555555",
+                                "password": "secret-password",
+                            }
+                        ],
+                        "tls": {
+                            "enabled": True,
+                            "reality": {"enabled": True, "private_key": "secret-key"},
+                        },
+                    }
+                ]
+            },
+            "s-ui-db",
+            Path("s-ui.db"),
+        )
+        output = io.StringIO()
+        with mock.patch.object(converter, "resolve_source", return_value=source), contextlib.redirect_stdout(
+            output
+        ):
+            exit_code = converter.command_inspect(argparse.Namespace())
+
+        rendered = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("vless-main", rendered)
+        self.assertIn("reality", rendered)
+        self.assertNotIn("11111111", rendered)
+        self.assertNotIn("secret-password", rendered)
+        self.assertNotIn("secret-key", rendered)
+
+    def test_menu_safe_preflight_and_exit(self):
+        output = io.StringIO()
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", side_effect=["2\n", "0\n"]
+        ), mock.patch.object(converter, "run_menu_action", return_value=0) as action, contextlib.redirect_stdout(
+            output
+        ):
+            exit_code = converter.command_menu(argparse.Namespace())
+
+        self.assertEqual(exit_code, 0)
+        action.assert_called_once_with(["deploy", "--strict"])
+        self.assertIn("安全预检", output.getvalue())
+
+    def test_menu_cancelled_apply_does_not_run_action(self):
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", side_effect=["5\n", "cancel\n", "0\n"]
+        ), mock.patch.object(converter, "run_menu_action") as action, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            exit_code = converter.command_menu(argparse.Namespace())
+
+        self.assertEqual(exit_code, 0)
+        action.assert_not_called()
 
     def test_converts_shadowsocks_and_socks(self):
         source = {

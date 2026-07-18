@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -1108,6 +1108,36 @@ def report_conversion(result: ConversionResult) -> None:
         log("SKIP", skipped)
 
 
+def command_inspect(args: argparse.Namespace) -> int:
+    source = resolve_source(args)
+    inbounds = source.config.get("inbounds", [])
+    print(f"\n可迁移入站（来源：{source.label}）：")
+    for index, inbound in enumerate(inbounds, 1):
+        if not isinstance(inbound, dict):
+            print(f"  {index}. <invalid inbound>")
+            continue
+        inbound_type = nonempty_string(inbound.get("type")) or "<unknown>"
+        tag = source_tag(inbound, index - 1)
+        port = inbound.get("listen_port", "<unknown>")
+        transport = inbound.get("transport")
+        network = "tcp"
+        if isinstance(transport, dict):
+            network = nonempty_string(transport.get("type")) or "tcp"
+        tls = inbound.get("tls")
+        security = "none"
+        if isinstance(tls, dict) and tls.get("enabled", True):
+            reality = tls.get("reality")
+            security = "reality" if isinstance(reality, dict) and reality.get("enabled", True) else "tls"
+        users = inbound.get("users")
+        user_count = len(users) if isinstance(users, list) else 0
+        supported = "支持" if inbound_type.lower() in SUPPORTED_TYPES else "不支持"
+        print(
+            f"  {index}. {tag} | {inbound_type} | 端口 {port} | "
+            f"{network} + {security} | 用户 {user_count} | {supported}"
+        )
+    return 0
+
+
 def command_convert(args: argparse.Namespace) -> int:
     source = resolve_source(args)
     result = convert_config(source.config, make_options(args))
@@ -1305,7 +1335,105 @@ def command_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
-def add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
+def menu_prompt(message: str) -> str:
+    print(message, end="", flush=True)
+    value = sys.stdin.readline()
+    if value == "":
+        raise MigrationError("interactive menu was closed")
+    return value.strip()
+
+
+def run_menu_action(argv: list[str]) -> int:
+    print()
+    exit_code = main(argv)
+    if exit_code == 0:
+        print("\n操作完成。")
+    else:
+        print(f"\n操作失败，退出码：{exit_code}")
+    return exit_code
+
+
+def command_menu(_args: argparse.Namespace) -> int:
+    if not sys.stdin.isatty():
+        raise MigrationError("the interactive menu requires a terminal")
+    try:
+        while True:
+            print(
+                f"""
+singbox_to_xray {VERSION}
+========================================
+  1. 查看数据源与可迁移入站
+  2. 安全预检（推荐，不写入）
+  3. 选择数据源后预检
+  4. 隔离端口预检
+  5. 正式迁移到 Xray
+  6. 回滚最近一次迁移
+  7. 显示命令帮助
+  0. 退出
+========================================"""
+            )
+            choice = menu_prompt("请选择 [0-7]：")
+            if choice == "0":
+                print("已退出。")
+                return 0
+            if choice == "1":
+                run_menu_action(["inspect", "--interactive"])
+            elif choice == "2":
+                run_menu_action(["deploy", "--strict"])
+            elif choice == "3":
+                run_menu_action(["deploy", "--interactive", "--strict"])
+            elif choice == "4":
+                offset = menu_prompt("端口偏移量 [10000]：") or "10000"
+                try:
+                    int(offset)
+                except ValueError:
+                    print("端口偏移量必须是整数。")
+                    continue
+                suffix = menu_prompt("tag 后缀 [-stage]：") or "-stage"
+                run_menu_action(
+                    [
+                        "deploy",
+                        "--interactive",
+                        "--strict",
+                        "--port-offset",
+                        offset,
+                        f"--tag-suffix={suffix}",
+                    ]
+                )
+            elif choice == "5":
+                print(
+                    "\n正式迁移会备份并写入 Xray 配置，然后重启 Xray。\n"
+                    "请先停止旧 Core 并确认目标端口已释放。"
+                )
+                if menu_prompt("输入 APPLY 继续，其他内容取消：") != "APPLY":
+                    print("已取消正式迁移。")
+                    continue
+                command = ["deploy", "--interactive", "--strict", "--apply"]
+                if menu_prompt("替换 Xray 中同 tag 入站？[y/N]：").lower() in {"y", "yes"}:
+                    command.append("--replace-existing")
+                if menu_prompt("迁移后通知 miaomiaowuX 主控？[y/N]：").lower() in {"y", "yes"}:
+                    command.append("--notify-master")
+                run_menu_action(command)
+            elif choice == "6":
+                print("\n回滚会恢复最近一次部署前的 Xray 配置并重启 Xray。")
+                if menu_prompt("输入 ROLLBACK 继续，其他内容取消：") != "ROLLBACK":
+                    print("已取消回滚。")
+                    continue
+                command = ["rollback"]
+                if menu_prompt("回滚后通知 miaomiaowuX 主控？[y/N]：").lower() in {"y", "yes"}:
+                    command.append("--notify-master")
+                run_menu_action(command)
+            elif choice == "7":
+                print()
+                build_parser().print_help()
+            else:
+                print("无效选项，请重新选择。")
+    except KeyboardInterrupt:
+        print("\n已取消并退出。")
+        return 130
+
+
+def add_source_arguments(parser: argparse.ArgumentParser) -> None:
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument(
         "--input",
@@ -1324,6 +1452,10 @@ def add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="ask which source to use when multiple non-empty sources are detected",
     )
+
+
+def add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
+    add_source_arguments(parser)
     parser.add_argument("--tag", action="append", help="convert only this source inbound tag; repeatable")
     parser.add_argument("--strict", action="store_true", help="fail instead of skipping unsupported inbounds")
     parser.add_argument("--port-offset", type=int, default=0, help="add this value to every source port")
@@ -1350,6 +1482,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    menu_parser = subparsers.add_parser("menu", help="open the interactive Chinese menu")
+    menu_parser.set_defaults(handler=command_menu)
+
+    inspect_parser = subparsers.add_parser("inspect", help="list source inbounds without secrets")
+    add_source_arguments(inspect_parser)
+    inspect_parser.set_defaults(handler=command_inspect)
 
     convert_parser = subparsers.add_parser("convert", help="convert only; never modify Xray")
     add_conversion_arguments(convert_parser)
@@ -1392,7 +1531,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    effective_argv = sys.argv[1:] if argv is None else argv
+    if not effective_argv and sys.stdin.isatty():
+        effective_argv = ["menu"]
+    args = parser.parse_args(effective_argv)
     if getattr(args, "notify_master", False) and not getattr(args, "apply", True):
         parser.error("--notify-master requires --apply")
     try:

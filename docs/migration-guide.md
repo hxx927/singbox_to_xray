@@ -8,6 +8,8 @@ S-UI 1.5.x 把入站、TLS 和客户端信息保存在 SQLite 数据库中，并
 
 脚本默认检测 `/usr/local/s-ui/db/s-ui.db`。数据库中存在入站时，它优先读取该数据库；只有 S-UI 数据库没有入站时，才回退到普通 sing-box JSON。可以先执行以下 dry-run 确认日志中的 `[SOURCE]`：
 
+安装后可以运行 `sudo s-x` 打开中文交互菜单，选择 `1` 查看入站，选择 `2` 执行推荐的安全预检。正式迁移和回滚分别要求输入 `APPLY` 和 `ROLLBACK`，避免误操作。
+
 ```bash
 sudo singbox-to-xray deploy --strict
 ```
