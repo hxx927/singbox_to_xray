@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "singbox-to-xray"
+version = "0.1.0"
+description = "Convert S-UI/sing-box inbounds and safely deploy them to miaomiaowuX-managed Xray"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [
+  {name = "singbox_to_xray contributors"},
+]
+keywords = ["sing-box", "xray", "s-ui", "miaomiaowux", "proxy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.scripts]
+singbox-to-xray = "singbox_to_xray:main"
+
+[project.urls]
+Homepage = "https://github.com/hxx927/singbox_to_xray"
+Issues = "https://github.com/hxx927/singbox_to_xray/issues"
+
+[tool.setuptools]
+py-modules = ["singbox_to_xray"]
