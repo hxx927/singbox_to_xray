@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/hxx927/singbox_to_xray/main/install
 安装器同时创建短命令 `/usr/local/bin/s-x`。root 用户直接输入 `s-x`，普通用户输入 `sudo s-x`，即可打开中文交互菜单：
 
 ```text
-singbox_to_xray 0.3.0
+singbox_to_xray 0.3.x
 ========================================
   1. 查看数据源与可迁移入站
   2. 安全预检（推荐，不写入）
@@ -112,6 +112,21 @@ sudo singbox-to-xray deploy --strict
 ```bash
 sudo singbox-to-xray deploy --strict --apply --notify-master
 ```
+
+## 正式迁移提示端口占用
+
+在菜单选择 `5` 后，如果目标端口仍由 S-UI 或 sing-box 占用，脚本会在写入 Xray 前停止，并针对实际端口和进程显示处理步骤。例如检测到新版 S-UI 时会提示：
+
+```text
+目标端口仍被旧进程占用：50965(sui)
+Xray 配置尚未写入，请按下面步骤处理：
+1. 保持当前 SSH 会话，另开一个 SSH 窗口连接服务器。
+2. 执行：systemctl stop s-ui
+3. 使用提示中的 ss 命令确认端口已释放。
+4. 回到 s-x 菜单，重新选择 5。
+```
+
+停止 `s-ui` 会让面板暂时离线，但不会删除 S-UI 数据库或节点。独立 sing-box 占用时，脚本会改为提示检查并停止 `sing-box` 服务；其他进程则提示先用 `ss` 定位。不要使用 `--allow-active-port` 强行绕过同端口冲突。
 
 脚本成功退出时，状态文件 `/var/lib/mmwx-singbox-migrate/state.json` 中应为：
 

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -923,6 +923,47 @@ def listening_port_owners() -> dict[int, str]:
     return result
 
 
+def port_conflict_guidance(conflicts: dict[int, str]) -> str:
+    detail = ", ".join(f"{port}({owner})" for port, owner in sorted(conflicts.items()))
+    ports = "|".join(str(port) for port in sorted(conflicts))
+    owners = {owner.lower() for owner in conflicts.values()}
+    lines = [
+        f"目标端口仍被旧进程占用：{detail}",
+        "Xray 配置尚未写入，请按下面步骤处理：",
+    ]
+    if any(owner in {"sui", "s-ui"} or "s-ui" in owner for owner in owners):
+        lines.extend(
+            [
+                "1. 保持当前 SSH 会话，另开一个 SSH 窗口连接服务器。",
+                "2. 新版 S-UI 的 sing-box Core 内嵌在 s-ui 服务中，执行：systemctl stop s-ui",
+                "   注意：S-UI 面板会暂时离线，但数据库和节点不会被删除。",
+            ]
+        )
+    elif any("sing-box" in owner or "singbox" in owner for owner in owners):
+        lines.extend(
+            [
+                "1. 先确认这是需要迁移的旧 sing-box：systemctl status sing-box --no-pager",
+                "2. 确认后停止它：systemctl stop sing-box",
+                "   如果不是 systemd 服务，请用下面的 ss 命令定位 PID 后停止对应进程。",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "1. 先用下面的 ss 命令确认占用进程。",
+                "2. 停止对应服务；不要直接结束不认识的系统进程。",
+            ]
+        )
+    lines.extend(
+        [
+            f"3. 确认端口已释放（命令无输出才算成功）：ss -H -lntup | grep -E ':({ports})([[:space:]]|$)'",
+            "4. 回到 s-x 菜单，重新选择 5 执行正式迁移。",
+            "不要使用 --allow-active-port 绕过同端口检查。",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def wait_for_ports(ports: set[int], timeout: int = 12) -> set[int]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1181,10 +1222,7 @@ def command_deploy(args: argparse.Namespace) -> int:
         active = listening_port_owners()
         conflicts = {port: active[port] for port in desired_ports if port in active and active[port] != "xray"}
         if conflicts:
-            detail = ", ".join(f"{port}({owner})" for port, owner in sorted(conflicts.items()))
-            raise MigrationError(
-                f"target port(s) are already active: {detail}; stop the old core or pass --allow-active-port"
-            )
+            raise MigrationError(port_conflict_guidance(conflicts))
 
     config_stat = config_path.stat()
     backup = backup_config(config_path)
@@ -1508,7 +1546,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="restart Agent, request master node sync, and verify persisted node tags",
     )
-    deploy_parser.add_argument("--allow-active-port", action="store_true", help="allow a non-Xray process on a target port")
+    deploy_parser.add_argument(
+        "--allow-active-port",
+        action="store_true",
+        help="advanced override for non-Xray port ownership; unsafe for same-port migration",
+    )
     deploy_parser.add_argument("--xray-service", default="xray")
     deploy_parser.add_argument("--agent-service", default="mmw-agent")
     deploy_parser.add_argument("--agent-config", default=DEFAULT_AGENT_CONFIG)

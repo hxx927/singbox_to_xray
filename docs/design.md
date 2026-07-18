@@ -94,6 +94,7 @@ sing-box 服务端通常只有私钥，而 miaomiaowuX 生成订阅节点需要 
 
 - 不覆盖整个 Xray 配置，只修改顶层 `inbounds`，保留 `api`、`stats`、`policy`、`metrics`、路由和出站。
 - 默认拒绝覆盖同 tag 入站；只有显式 `--replace-existing` 才替换。
+- 正式迁移检测到非 Xray 进程占用目标端口时，在任何备份或写盘前终止；错误信息按 `sui`、`sing-box` 或其他进程分类，给出停止、复查端口和菜单重试步骤。
 - 拒绝重复 tag、无效端口、转换后端口碰撞，以及与现有 Xray 入站的端口碰撞。
 - 写盘前必须通过 `xray run -test -config`。
 - 写盘采用同目录临时文件和 `os.replace`，避免进程中断留下半截 JSON。

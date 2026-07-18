@@ -28,6 +28,8 @@ sudo singbox-to-xray deploy --interactive --strict
 
 也可以使用 `--s-ui-db PATH` 或 `--input PATH` 强制指定来源。脚本使用 SQLite 只读连接，不修改 S-UI 数据库。
 
+菜单选择正式迁移后，如果旧 Core 仍占用目标端口，脚本不会写入 Xray，而会根据 `ss` 识别到的进程显示下一步命令：S-UI 1.5.x 通常提示 `systemctl stop s-ui`，独立 sing-box 通常提示检查并执行 `systemctl stop sing-box`。按提示确认端口无监听后，回到菜单重新选择 `5`。停止 S-UI 只会让面板暂时离线，不会删除数据库或节点。
+
 ## 先说结论
 
 sing-box 入站不能原样粘贴给 Xray。两者表达的是同一组协议参数，但字段名和层级不同：

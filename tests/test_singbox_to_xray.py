@@ -218,6 +218,22 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         action.assert_not_called()
 
+    def test_port_conflict_guidance_for_embedded_sui(self):
+        message = converter.port_conflict_guidance({50965: "sui"})
+
+        self.assertIn("50965(sui)", message)
+        self.assertIn("systemctl stop s-ui", message)
+        self.assertIn("面板会暂时离线", message)
+        self.assertIn("重新选择 5", message)
+        self.assertIn("不要使用 --allow-active-port", message)
+
+    def test_port_conflict_guidance_for_standalone_singbox(self):
+        message = converter.port_conflict_guidance({443: "sing-box"})
+
+        self.assertIn("systemctl status sing-box", message)
+        self.assertIn("systemctl stop sing-box", message)
+        self.assertIn(":(443)([[:space:]]|$)", message)
+
     def test_converts_shadowsocks_and_socks(self):
         source = {
             "inbounds": [
