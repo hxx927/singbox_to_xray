@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -23,7 +24,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+VERSION = "0.2.0"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
+DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
 DEFAULT_STATE_FILE = "/var/lib/mmwx-singbox-migrate/state.json"
 DEFAULT_AGENT_CONFIG = "/etc/mmw-agent/config.yaml"
@@ -36,6 +39,21 @@ SUPPORTED_TYPES = {
     "hysteria2",
     "socks",
     "http",
+}
+SUI_USER_TYPES = {
+    "mixed",
+    "socks",
+    "http",
+    "shadowsocks",
+    "vmess",
+    "trojan",
+    "naive",
+    "hysteria",
+    "shadowtls",
+    "tuic",
+    "hysteria2",
+    "vless",
+    "anytls",
 }
 
 
@@ -66,6 +84,22 @@ class ConversionResult:
     skipped: list[str] = field(default_factory=list)
 
 
+@dataclass
+class SourceDocument:
+    config: dict[str, Any]
+    kind: str
+    path: Path
+
+    @property
+    def inbound_count(self) -> int:
+        inbounds = self.config.get("inbounds")
+        return len(inbounds) if isinstance(inbounds, list) else 0
+
+    @property
+    def label(self) -> str:
+        return "S-UI database" if self.kind == "s-ui-db" else "sing-box JSON"
+
+
 def log(level: str, message: str) -> None:
     print(f"[{level}] {message}", file=sys.stderr)
 
@@ -82,6 +116,173 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise MigrationError(f"top-level JSON must be an object: {path}")
     return value
+
+
+def parse_database_json(value: Any, context: str, expected: type = dict) -> Any:
+    if value in (None, ""):
+        return expected()
+    try:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MigrationError(f"invalid JSON in S-UI {context}: {exc}") from exc
+    if not isinstance(parsed, expected):
+        raise MigrationError(f"S-UI {context} must contain a {expected.__name__}")
+    return parsed
+
+
+def sui_client_config_key(inbound_type: str, inbound: dict[str, Any]) -> str:
+    if inbound_type != "shadowsocks":
+        return inbound_type
+    method = nonempty_string(inbound.get("method"))
+    if method == "2022-blake3-aes-128-gcm":
+        return "shadowsocks16"
+    if method in {"2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"}:
+        return "shadowsocks32"
+    return "shadowsocks"
+
+
+def strip_sui_vless_vision(user: Any) -> Any:
+    # S-UI removes Vision when VLESS uses a transport or has no TLS.
+    serialized = json.dumps(user, ensure_ascii=False)
+    return json.loads(serialized.replace("xtls-rprx-vision", ""))
+
+
+def load_sui_database(path: Path) -> dict[str, Any]:
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+    except (OSError, sqlite3.Error) as exc:
+        raise MigrationError(f"cannot open S-UI database {path}: {exc}") from exc
+
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        rows = connection.execute(
+            "SELECT id, type, tag, tls_id, options FROM inbounds ORDER BY id"
+        ).fetchall()
+        inbounds: list[dict[str, Any]] = []
+        for row in rows:
+            inbound_id = int(row["id"])
+            inbound_type = nonempty_string(row["type"]).lower()
+            tag = nonempty_string(row["tag"])
+            context = f"inbound {tag or inbound_id!r}"
+            inbound = parse_database_json(row["options"], f"{context} options")
+            inbound["type"] = inbound_type
+            inbound["tag"] = tag
+
+            tls_id = int(row["tls_id"] or 0)
+            if tls_id:
+                tls_row = connection.execute("SELECT server FROM tls WHERE id = ?", (tls_id,)).fetchone()
+                if tls_row is None:
+                    raise MigrationError(f"S-UI {context} references missing TLS record {tls_id}")
+                inbound["tls"] = parse_database_json(tls_row["server"], f"TLS record {tls_id}")
+
+            if inbound_type in SUI_USER_TYPES:
+                config_key = sui_client_config_key(inbound_type, inbound)
+                users: list[Any] = []
+                client_rows = connection.execute(
+                    "SELECT config, inbounds FROM clients WHERE enable = 1 ORDER BY id"
+                ).fetchall()
+                for client_row in client_rows:
+                    inbound_ids = parse_database_json(
+                        client_row["inbounds"], "client inbound assignments", list
+                    )
+                    if str(inbound_id) not in {str(value) for value in inbound_ids}:
+                        continue
+                    client_config = parse_database_json(client_row["config"], "client config")
+                    user = client_config.get(config_key)
+                    if user is None:
+                        continue
+                    if isinstance(user, str):
+                        try:
+                            user = json.loads(user)
+                        except json.JSONDecodeError:
+                            pass
+                    transport = inbound.get("transport")
+                    has_transport = isinstance(transport, dict) and bool(
+                        nonempty_string(transport.get("type"))
+                    )
+                    if inbound_type == "vless" and ("tls" not in inbound or has_transport):
+                        user = strip_sui_vless_vision(user)
+                    users.append(user)
+                inbound["users"] = users
+            inbounds.append(inbound)
+    except sqlite3.Error as exc:
+        raise MigrationError(f"cannot read S-UI database {path}: {exc}") from exc
+    finally:
+        connection.close()
+    return {"inbounds": inbounds}
+
+
+def choose_source(candidates: list[SourceDocument], interactive: bool) -> SourceDocument:
+    if not candidates:
+        raise MigrationError(
+            "no inbound source found; pass --s-ui-db PATH or --input PATH"
+        )
+    if not interactive or len(candidates) == 1:
+        return candidates[0]
+    if not sys.stdin.isatty():
+        raise MigrationError("--interactive requires a terminal")
+
+    print("Detected inbound sources:", file=sys.stderr)
+    for index, candidate in enumerate(candidates, 1):
+        print(
+            f"  {index}. {candidate.label}: {candidate.path} "
+            f"({candidate.inbound_count} inbound(s))",
+            file=sys.stderr,
+        )
+    while True:
+        print(
+            f"Select source [1-{len(candidates)}] (default 1): ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        answer = sys.stdin.readline()
+        if answer == "":
+            raise MigrationError("interactive source selection was cancelled")
+        answer = answer.strip()
+        if not answer:
+            return candidates[0]
+        try:
+            selected = int(answer)
+        except ValueError:
+            selected = 0
+        if 1 <= selected <= len(candidates):
+            return candidates[selected - 1]
+        print("Invalid selection.", file=sys.stderr)
+
+
+def resolve_source(args: argparse.Namespace) -> SourceDocument:
+    if args.input:
+        path = Path(args.input)
+        source = SourceDocument(load_json(path), "json", path)
+    elif args.s_ui_db:
+        path = Path(args.s_ui_db)
+        source = SourceDocument(load_sui_database(path), "s-ui-db", path)
+    else:
+        candidates: list[SourceDocument] = []
+        sui_path = Path(DEFAULT_SUI_DB)
+        if sui_path.exists():
+            sui_source = SourceDocument(load_sui_database(sui_path), "s-ui-db", sui_path)
+            if sui_source.inbound_count:
+                candidates.append(sui_source)
+
+        json_path = Path(DEFAULT_SINGBOX_CONFIG)
+        if json_path.exists():
+            json_source = SourceDocument(load_json(json_path), "json", json_path)
+            if json_source.inbound_count:
+                candidates.append(json_source)
+        source = choose_source(candidates, args.interactive)
+
+    log(
+        "SOURCE",
+        f"selected {source.label} {source.path} ({source.inbound_count} inbound(s))",
+    )
+    return source
 
 
 def as_list(value: Any) -> list[Any]:
@@ -908,8 +1109,8 @@ def report_conversion(result: ConversionResult) -> None:
 
 
 def command_convert(args: argparse.Namespace) -> int:
-    source = load_json(Path(args.input))
-    result = convert_config(source, make_options(args))
+    source = resolve_source(args)
+    result = convert_config(source.config, make_options(args))
     report_conversion(result)
     payload: Any = result.inbounds if args.array else {"inbounds": result.inbounds}
     output = json_text(payload)
@@ -922,11 +1123,10 @@ def command_convert(args: argparse.Namespace) -> int:
 
 
 def command_deploy(args: argparse.Namespace) -> int:
-    source_path = Path(args.input)
+    source = resolve_source(args)
     config_path = Path(args.xray_config)
-    source = load_json(source_path)
     current = load_json(config_path)
-    result = convert_config(source, make_options(args))
+    result = convert_config(source.config, make_options(args))
     merged = merge_inbounds(current, result.inbounds, args.replace_existing)
     report_conversion(result)
 
@@ -961,7 +1161,8 @@ def command_deploy(args: argparse.Namespace) -> int:
     state = {
         "version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source": str(source_path),
+        "source": str(source.path),
+        "source_type": source.kind,
         "xray_config": str(config_path),
         "backup": str(backup),
         "xray_service": args.xray_service,
@@ -1105,7 +1306,24 @@ def command_rollback(args: argparse.Namespace) -> int:
 
 
 def add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--input", default=DEFAULT_SINGBOX_CONFIG, help="sing-box config.json path")
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--input",
+        help=(
+            "sing-box config.json path; when omitted, prefer a detected S-UI database "
+            "and fall back to the default JSON path"
+        ),
+    )
+    source_group.add_argument(
+        "--s-ui-db",
+        metavar="PATH",
+        help=f"read S-UI 1.5.x inbounds from SQLite (default auto-detect: {DEFAULT_SUI_DB})",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="ask which source to use when multiple non-empty sources are detected",
+    )
     parser.add_argument("--tag", action="append", help="convert only this source inbound tag; repeatable")
     parser.add_argument("--strict", action="store_true", help="fail instead of skipping unsupported inbounds")
     parser.add_argument("--port-offset", type=int, default=0, help="add this value to every source port")
@@ -1130,7 +1348,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert S-UI/sing-box inbounds to miaomiaowuX-managed Xray inbounds"
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     convert_parser = subparsers.add_parser("convert", help="convert only; never modify Xray")

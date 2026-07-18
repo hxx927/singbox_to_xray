@@ -28,4 +28,4 @@ python3 "$tmp_file" --version >/dev/null
 install -m 0755 "$tmp_file" "$DESTINATION"
 
 echo "installed singbox-to-xray to $DESTINATION"
-echo "run: sudo $DESTINATION deploy"
+echo "run a safe S-UI/Xray preflight: sudo $DESTINATION deploy --strict"

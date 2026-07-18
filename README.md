@@ -1,6 +1,6 @@
 # singbox_to_xray
 
-将 S-UI 生成的 sing-box 入站转换为 Xray 入站，并安全合并到 miaomiaowuX Agent 管理的 Xray 配置。
+将 S-UI 生成的 sing-box 入站转换为 Xray 入站，并安全合并到 miaomiaowuX Agent 管理的 Xray 配置。支持直接读取新版 S-UI SQLite 数据库，不依赖另一个 sing-box 安装留下的 `config.json`。
 
 脚本只使用 Python 标准库，默认支持预检、备份、原子写入、Xray 重启检查、Agent 上报、主控节点同步确认和一键回滚。
 
@@ -37,12 +37,47 @@ python3 singbox_to_xray.py --version
 
 - Linux 与 Python 3.9+
 - 已安装并由 systemd 管理的 Xray
-- 默认配置路径为 `/usr/local/etc/sing-box/config.json` 和 `/usr/local/etc/xray/config.json`
+- 默认自动检测 `/usr/local/s-ui/db/s-ui.db` 和 `/usr/local/etc/sing-box/config.json`
+- 只要 S-UI 数据库中存在入站，就优先使用 S-UI 数据库
+- Xray 默认配置路径为 `/usr/local/etc/xray/config.json`
 - 使用 `--notify-master` 时，需要 miaomiaowuX 主控提供 `/api/remote/sync-nodes`
+
+## 数据源选择
+
+不指定数据源时，脚本按以下顺序自动发现：
+
+1. `/usr/local/s-ui/db/s-ui.db` 中由 S-UI 管理的动态入站。
+2. `/usr/local/etc/sing-box/config.json` 中的普通 sing-box 入站。
+
+脚本以 SQLite 只读模式访问 S-UI 数据库，按照 S-UI 1.5.x 的规则组装 TLS 和已启用客户端，不修改数据库。每次执行都会明确打印实际选择的数据源：
+
+```text
+[SOURCE] selected S-UI database /usr/local/s-ui/db/s-ui.db (1 inbound(s))
+```
+
+多个来源都有入站时，可以交互选择：
+
+```bash
+sudo singbox-to-xray deploy --interactive --strict
+```
+
+也可以显式指定来源，跳过自动发现：
+
+```bash
+sudo singbox-to-xray deploy \
+  --s-ui-db /usr/local/s-ui/db/s-ui.db \
+  --strict
+
+sudo singbox-to-xray deploy \
+  --input /path/to/sing-box-config.json \
+  --strict
+```
+
+新版 S-UI 把入站保存在数据库中，并由 S-UI 进程动态组装 sing-box 配置。单独检查 `/usr/local/etc/sing-box/config.json` 不能证明其中包含 S-UI 节点。
 
 ## 安全使用流程
 
-第一步只做预检，不修改配置：
+第一步自动读取 S-UI 入站并做预检，不修改配置：
 
 ```bash
 sudo singbox-to-xray deploy --strict
@@ -153,7 +188,7 @@ sudo singbox-to-xray deploy \
 python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖协议字段映射、TLS/REALITY、传输层、端口映射、合并冲突、Agent YAML 读取和主控节点确认。
+当前测试覆盖 S-UI SQLite 动态入站组装、数据源选择、协议字段映射、TLS/REALITY、传输层、端口映射、合并冲突、Agent YAML 读取和主控节点确认。
 
 ## 文档
 

@@ -2,14 +2,14 @@
 
 ## 目标
 
-脚本把 S-UI 生成的 sing-box 完整配置转换为 Xray inbound，并在同一台服务器上安全合并到 miaomiaowuX Agent 管理的 Xray 配置中。部署完成后，脚本等待 Agent 的 `scan_result`，再使用该服务器自身的 Agent token 请求主控同步节点，并校验节点表中已存在所有迁移 tag。
+脚本直接读取 S-UI 1.5.x SQLite 数据库或普通 sing-box 完整配置，将其转换为 Xray inbound，并在同一台服务器上安全合并到 miaomiaowuX Agent 管理的 Xray 配置中。部署完成后，脚本等待 Agent 的 `scan_result`，再使用该服务器自身的 Agent token 请求主控同步节点，并校验节点表中已存在所有迁移 tag。
 
 脚本不迁移 S-UI 的数据库、流量历史、套餐关系、路由、DNS 和出站。转换边界与[迁移教程](migration-guide.md)一致。
 
 ## 实际链路
 
 ```text
-S-UI sing-box config.json
+S-UI SQLite / sing-box config.json
            |
            v
    singbox_to_xray.py

@@ -2,6 +2,30 @@
 
 本文适用于把 S-UI 中由 sing-box 承载的服务端入站，迁移为 miaomiaowuX 管理的 Xray 入站。重点不是让两份 JSON 长得一样，而是保留客户端实际握手所依赖的参数，让原有客户端在切换后不需要改配置。
 
+## 新版 S-UI 的配置来源
+
+S-UI 1.5.x 把入站、TLS 和客户端信息保存在 SQLite 数据库中，并在 S-UI 进程内动态组装 sing-box 配置。它不要求把正在运行的完整配置写入 `/usr/local/etc/sing-box/config.json`。
+
+脚本默认检测 `/usr/local/s-ui/db/s-ui.db`。数据库中存在入站时，它优先读取该数据库；只有 S-UI 数据库没有入站时，才回退到普通 sing-box JSON。可以先执行以下 dry-run 确认日志中的 `[SOURCE]`：
+
+```bash
+sudo singbox-to-xray deploy --strict
+```
+
+预期来源日志类似：
+
+```text
+[SOURCE] selected S-UI database /usr/local/s-ui/db/s-ui.db (1 inbound(s))
+```
+
+如果同一台机器上还有独立 sing-box 配置，使用交互模式选择来源：
+
+```bash
+sudo singbox-to-xray deploy --interactive --strict
+```
+
+也可以使用 `--s-ui-db PATH` 或 `--input PATH` 强制指定来源。脚本使用 SQLite 只读连接，不修改 S-UI 数据库。
+
 ## 先说结论
 
 sing-box 入站不能原样粘贴给 Xray。两者表达的是同一组协议参数，但字段名和层级不同：

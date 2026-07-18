@@ -1,6 +1,8 @@
+import argparse
 import copy
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 import urllib.error
@@ -18,6 +20,140 @@ class ConverterTests(unittest.TestCase):
         }
         values.update(overrides)
         return converter.ConversionOptions(**values)
+
+    def create_sui_database(self, path: Path, *, transport=None):
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE inbounds (
+                id INTEGER PRIMARY KEY,
+                type TEXT,
+                tag TEXT,
+                tls_id INTEGER,
+                options TEXT
+            );
+            CREATE TABLE tls (
+                id INTEGER PRIMARY KEY,
+                server TEXT
+            );
+            CREATE TABLE clients (
+                id INTEGER PRIMARY KEY,
+                enable INTEGER,
+                config TEXT,
+                inbounds TEXT
+            );
+            """
+        )
+        options = {"listen": "::", "listen_port": 443}
+        if transport is not None:
+            options["transport"] = transport
+        tls = {
+            "enabled": True,
+            "server_name": "www.example.com",
+            "reality": {
+                "enabled": True,
+                "handshake": {"server": "www.example.com", "server_port": 443},
+                "private_key": "private-key",
+                "short_id": ["0123456789abcdef"],
+            },
+        }
+        client = {
+            "vless": {
+                "name": "alice",
+                "uuid": "11111111-2222-3333-4444-555555555555",
+                "flow": "xtls-rprx-vision",
+            }
+        }
+        connection.execute("INSERT INTO tls(id, server) VALUES(?, ?)", (7, json.dumps(tls)))
+        connection.execute(
+            "INSERT INTO inbounds(id, type, tag, tls_id, options) VALUES(?, ?, ?, ?, ?)",
+            (1, "vless", "vless-reality", 7, json.dumps(options)),
+        )
+        connection.execute(
+            "INSERT INTO clients(id, enable, config, inbounds) VALUES(?, ?, ?, ?)",
+            (1, 1, json.dumps(client), json.dumps([1])),
+        )
+        connection.execute(
+            "INSERT INTO clients(id, enable, config, inbounds) VALUES(?, ?, ?, ?)",
+            (2, 0, json.dumps(client), json.dumps([1])),
+        )
+        connection.commit()
+        connection.close()
+
+    def test_loads_sui_database_and_converts_dynamic_vless(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "s-ui.db"
+            self.create_sui_database(database)
+
+            source = converter.load_sui_database(database)
+
+        self.assertEqual(len(source["inbounds"]), 1)
+        inbound = source["inbounds"][0]
+        self.assertEqual(inbound["tag"], "vless-reality")
+        self.assertEqual(inbound["listen_port"], 443)
+        self.assertEqual(len(inbound["users"]), 1)
+        self.assertEqual(inbound["users"][0]["name"], "alice")
+        self.assertEqual(inbound["users"][0]["flow"], "xtls-rprx-vision")
+        with mock.patch.object(
+            converter, "derive_reality_public_key", return_value="derived-public-key"
+        ):
+            converted = converter.convert_config(
+                source, self.options(derive_reality_keys=True)
+            ).inbounds[0]
+        self.assertEqual(converted["protocol"], "vless")
+        self.assertEqual(converted["streamSettings"]["security"], "reality")
+
+    def test_sui_database_matches_vless_transport_flow_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "s-ui.db"
+            self.create_sui_database(database, transport={"type": "ws", "path": "/ws"})
+
+            source = converter.load_sui_database(database)
+
+        self.assertEqual(source["inbounds"][0]["users"][0]["flow"], "")
+
+    def test_auto_source_prefers_nonempty_sui_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "s-ui.db"
+            config = root / "config.json"
+            self.create_sui_database(database)
+            config.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "type": "shadowsocks",
+                                "tag": "legacy-json",
+                                "listen_port": 12345,
+                                "method": "aes-128-gcm",
+                                "password": "secret",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(input=None, s_ui_db=None, interactive=False)
+            with mock.patch.object(converter, "DEFAULT_SUI_DB", str(database)), mock.patch.object(
+                converter, "DEFAULT_SINGBOX_CONFIG", str(config)
+            ):
+                selected = converter.resolve_source(args)
+
+        self.assertEqual(selected.kind, "s-ui-db")
+        self.assertEqual(selected.config["inbounds"][0]["tag"], "vless-reality")
+
+    def test_interactive_source_selection_can_choose_json(self):
+        candidates = [
+            converter.SourceDocument({"inbounds": [{}]}, "s-ui-db", Path("s-ui.db")),
+            converter.SourceDocument({"inbounds": [{}]}, "json", Path("config.json")),
+        ]
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", return_value="2\n"
+        ):
+            selected = converter.choose_source(candidates, interactive=True)
+
+        self.assertEqual(selected.kind, "json")
 
     def test_converts_shadowsocks_and_socks(self):
         source = {
