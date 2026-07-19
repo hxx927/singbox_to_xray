@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -1181,6 +1182,156 @@ def request_master_node_sync(
     return result
 
 
+def client_credential_fingerprint(protocol: str, client: Any) -> str:
+    """Return a one-way identifier for a client credential without storing its secret."""
+    if not isinstance(client, dict):
+        return ""
+    material: list[str] = [protocol.strip().lower()]
+    for key in ("id", "password", "auth"):
+        value = nonempty_string(client.get(key))
+        if value:
+            material.extend([key, value])
+            break
+    else:
+        username = nonempty_string(client.get("user"))
+        password = nonempty_string(client.get("pass"))
+        if not username or not password:
+            return ""
+        material.extend(["user-pass", username, password])
+    encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def source_credential_records(inbounds: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for inbound in inbounds:
+        tag = nonempty_string(inbound.get("tag"))
+        protocol = nonempty_string(inbound.get("protocol")).lower()
+        settings = inbound.get("settings")
+        if not tag or not protocol or not isinstance(settings, dict):
+            continue
+        for container in ("clients", "accounts"):
+            entries = settings.get(container)
+            if not isinstance(entries, list):
+                continue
+            fingerprints = sorted(
+                {
+                    fingerprint
+                    for entry in entries
+                    if (fingerprint := client_credential_fingerprint(protocol, entry))
+                }
+            )
+            if fingerprints:
+                records[tag] = {
+                    "protocol": protocol,
+                    "container": container,
+                    "fingerprints": fingerprints,
+                }
+                break
+    return records
+
+
+def recover_legacy_source_credential_records(
+    state: dict[str, Any], xray_bin: str
+) -> dict[str, dict[str, Any]]:
+    """Rebuild fingerprints for a 0.4.0 state by re-reading its original source."""
+    source_value = nonempty_string(state.get("source"))
+    source_type = nonempty_string(state.get("source_type"))
+    deployed_tags = {
+        tag for tag in state.get("deployed_tags", []) if isinstance(tag, str) and tag
+    }
+    if not source_value or not deployed_tags:
+        raise MigrationError(
+            "the legacy migration state cannot identify its source and deployed tags; "
+            "run a new migration with singbox-to-xray 0.4.1"
+        )
+    source_path = Path(source_value)
+    if source_type == "s-ui-db":
+        source_config = load_sui_database(source_path)
+    elif source_type == "json":
+        source_config = load_json(source_path)
+    else:
+        raise MigrationError(
+            f"the legacy migration state has an unsupported source type: {source_type or '<empty>'}"
+        )
+    result = convert_config(
+        source_config,
+        ConversionOptions(
+            strict=True,
+            selected_tags=deployed_tags,
+            xray_bin=xray_bin,
+        ),
+    )
+    records = source_credential_records(result.inbounds)
+    if not records:
+        raise MigrationError(
+            "no removable source client could be recovered from the legacy migration source; "
+            "do not edit Xray manually"
+        )
+    return records
+
+
+def remove_recorded_source_clients(
+    config: dict[str, Any], records: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, int]]:
+    candidate = copy.deepcopy(config)
+    inbounds = candidate.get("inbounds")
+    if not isinstance(inbounds, list):
+        raise MigrationError("Xray config has no inbound list")
+    by_tag = {
+        nonempty_string(inbound.get("tag")): inbound
+        for inbound in inbounds
+        if isinstance(inbound, dict) and nonempty_string(inbound.get("tag"))
+    }
+    removed: dict[str, int] = {}
+    for tag, raw_record in records.items():
+        if not isinstance(tag, str) or not tag or not isinstance(raw_record, dict):
+            raise MigrationError("migration state contains an invalid source credential record")
+        protocol = nonempty_string(raw_record.get("protocol")).lower()
+        container = nonempty_string(raw_record.get("container"))
+        raw_fingerprints = raw_record.get("fingerprints")
+        if container not in {"clients", "accounts"} or not isinstance(raw_fingerprints, list):
+            raise MigrationError(f"migration state has an invalid credential record for {tag}")
+        fingerprints = {
+            value for value in raw_fingerprints if isinstance(value, str) and value
+        }
+        if not protocol or not fingerprints:
+            raise MigrationError(f"migration state has no source credential fingerprints for {tag}")
+        inbound = by_tag.get(tag)
+        if not isinstance(inbound, dict):
+            raise MigrationError(f"deployed inbound is missing from Xray config: {tag}")
+        current_protocol = nonempty_string(inbound.get("protocol")).lower()
+        if current_protocol != protocol:
+            raise MigrationError(
+                f"protocol for {tag} changed from {protocol} to {current_protocol or '<empty>'}"
+            )
+        settings = inbound.get("settings")
+        if not isinstance(settings, dict) or not isinstance(settings.get(container), list):
+            raise MigrationError(f"credential list {container} is missing from inbound {tag}")
+
+        matching: list[Any] = []
+        remaining: list[Any] = []
+        remaining_credentials = 0
+        for entry in settings[container]:
+            fingerprint = client_credential_fingerprint(protocol, entry)
+            if fingerprint and fingerprint in fingerprints:
+                matching.append(entry)
+            else:
+                remaining.append(entry)
+                if fingerprint:
+                    remaining_credentials += 1
+        if not matching:
+            continue
+        if remaining_credentials == 0:
+            raise MigrationError(
+                f"refusing to remove source clients from {tag}: no replacement Xray client "
+                "was detected; scan remote services and accept Agent state first"
+            )
+        settings[container] = remaining
+        removed[tag] = len(matching)
+    return candidate, removed
+
+
 def backup_config(config_path: Path) -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup = config_path.with_name(f".{config_path.name}.mmwx-migrate-{timestamp}.bak")
@@ -1306,17 +1457,19 @@ def command_deploy(args: argparse.Namespace) -> int:
     backup = backup_config(config_path)
     stopped_source_services: list[str] = []
     state = {
-        "version": 1,
+        "version": 2,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "source": str(source.path),
         "source_type": source.kind,
         "xray_config": str(config_path),
         "backup": str(backup),
+        "xray_bin": args.xray_bin,
         "xray_service": args.xray_service,
         "agent_service": args.agent_service,
         "agent_config": args.agent_config,
         "deployed_tags": [item["tag"] for item in result.inbounds],
         "deployed_ports": sorted(desired_ports),
+        "source_credentials": source_credential_records(result.inbounds),
         "source_services_to_stop": source_services,
         "status": "deploying",
     }
@@ -1446,6 +1599,97 @@ def command_deploy(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_revoke_source_clients(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        raise MigrationError("revoke-source-clients must run as root")
+    state_path = Path(args.state_file)
+    state = load_json(state_path)
+    xray_bin = args.xray_bin or nonempty_string(state.get("xray_bin")) or "xray"
+    records = state.get("source_credentials")
+    if not isinstance(records, dict) or not records:
+        records = recover_legacy_source_credential_records(state, xray_bin)
+        state["source_credentials"] = records
+        state["source_credentials_recovered_from_legacy_state"] = True
+        write_state(state_path, state)
+        log("OK", "recovered source client fingerprints from the legacy migration source")
+    config_value = args.xray_config or nonempty_string(state.get("xray_config"))
+    if not config_value:
+        raise MigrationError(f"invalid migration state: {state_path}")
+    config_path = Path(config_value)
+    current = load_json(config_path)
+    candidate, removed = remove_recorded_source_clients(current, records)
+    if not removed:
+        log("OK", "recorded source clients are already absent; no configuration change was needed")
+        return 0
+
+    xray_service = args.xray_service or nonempty_string(state.get("xray_service")) or "xray"
+    validate_xray_config(candidate, xray_bin)
+    log("OK", "credential-pruned Xray config passed xray -test")
+
+    config_stat = config_path.stat()
+    backup = backup_config(config_path)
+    affected_ports = {
+        int(inbound["port"])
+        for inbound in candidate.get("inbounds", [])
+        if isinstance(inbound, dict)
+        and nonempty_string(inbound.get("tag")) in removed
+        and isinstance(inbound.get("port"), int)
+    }
+    state["source_client_revoke_backup"] = str(backup)
+    state["source_client_revoke_backup_restores_legacy_credentials"] = True
+    state["status"] = "revoking_source_clients"
+    write_state(state_path, state)
+
+    try:
+        atomic_write(
+            config_path,
+            json_text(candidate),
+            mode=stat.S_IMODE(config_stat.st_mode),
+            owner=(config_stat.st_uid, config_stat.st_gid),
+        )
+        service_action(xray_service, "restart")
+        if not service_active(xray_service):
+            raise MigrationError("Xray did not become active after source client revocation")
+        missing_ports = wait_for_ports(affected_ports)
+        if missing_ports:
+            raise MigrationError(
+                "Xray is active but revoked inbound port(s) are not listening: "
+                + ", ".join(str(port) for port in sorted(missing_ports))
+            )
+    except Exception as exc:
+        log("ERROR", f"source client revocation failed, restoring {backup}")
+        try:
+            restore_backup(config_path, backup, xray_service)
+        except Exception as rollback_exc:
+            state["status"] = "source_client_revoke_rollback_failed"
+            state["source_client_revoke_error"] = str(exc)
+            state["source_client_revoke_rollback_error"] = str(rollback_exc)
+            write_state(state_path, state)
+            raise MigrationError(
+                f"source client revocation failed: {exc}; automatic rollback failed: {rollback_exc}"
+            ) from exc
+        state["status"] = "source_client_revoke_auto_rolled_back"
+        state["source_client_revoke_error"] = str(exc)
+        write_state(state_path, state)
+        raise MigrationError(f"source client revocation failed and was rolled back: {exc}") from exc
+
+    state["status"] = "source_clients_revoked"
+    state["source_clients_revoked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    state["source_clients_revoked"] = removed
+    state.pop("source_client_revoke_error", None)
+    state.pop("source_client_revoke_rollback_error", None)
+    write_state(state_path, state)
+    for tag, count in sorted(removed.items()):
+        log("OK", f"revoked {count} recorded source client(s) from {tag}")
+    log("WARN", f"backup {backup} still contains the revoked credentials")
+    print(
+        "原 S-UI client 已从当前 Xray 配置删除。\n"
+        "请分别真实连接测试：原 S-UI 节点应失败，Xray 管理员节点和用户套餐节点应正常。",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def command_rollback(args: argparse.Namespace) -> int:
     if os.geteuid() != 0:
         raise MigrationError("rollback must run as root")
@@ -1558,12 +1802,13 @@ singbox_to_xray {VERSION}
   3. 选择数据源后预检
   4. 隔离端口预检
   5. 正式迁移到 Xray（可自动停止旧 Core）
-  6. 回滚最近一次迁移
-  7. 显示命令帮助
+  6. 删除原 S-UI client（需先确认新节点正常）
+  7. 回滚最近一次迁移
+  8. 显示命令帮助
   0. 退出
 ========================================"""
             )
-            choice = menu_prompt("请选择 [0-7]：")
+            choice = menu_prompt("请选择 [0-8]：")
             if choice == "0":
                 print("已退出。")
                 return 0
@@ -1612,6 +1857,15 @@ singbox_to_xray {VERSION}
                     command.append("--notify-master")
                 run_menu_action(command)
             elif choice == "6":
+                print(
+                    "\n此操作只删除迁移时记录的原 S-UI client，不修改节点管理和主控数据。\n"
+                    "请先完成‘扫描远程服务 → 接受 Agent 现状’，并确认管理员节点和用户套餐节点真实可用。"
+                )
+                if menu_prompt("输入 REVOKE 继续，其他内容取消：") != "REVOKE":
+                    print("已取消删除原 S-UI client。")
+                    continue
+                run_menu_action(["revoke-source-clients"])
+            elif choice == "7":
                 print("\n回滚会恢复最近一次部署前的 Xray 配置并重启 Xray。")
                 if menu_prompt("输入 ROLLBACK 继续，其他内容取消：") != "ROLLBACK":
                     print("已取消回滚。")
@@ -1620,7 +1874,7 @@ singbox_to_xray {VERSION}
                 if menu_prompt("回滚后通知 miaomiaowuX 主控？[y/N]：").lower() in {"y", "yes"}:
                     command.append("--notify-master")
                 run_menu_action(command)
-            elif choice == "7":
+            elif choice == "8":
                 print()
                 build_parser().print_help()
             else:
@@ -1722,6 +1976,16 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--scan-timeout", type=int, default=25)
     deploy_parser.add_argument("--master-sync-timeout", type=int, default=45)
     deploy_parser.set_defaults(handler=command_deploy)
+
+    revoke_parser = subparsers.add_parser(
+        "revoke-source-clients",
+        help="remove the source S-UI clients recorded during the latest migration",
+    )
+    revoke_parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    revoke_parser.add_argument("--xray-config")
+    revoke_parser.add_argument("--xray-bin")
+    revoke_parser.add_argument("--xray-service")
+    revoke_parser.set_defaults(handler=command_revoke_source_clients)
 
     rollback_parser = subparsers.add_parser("rollback", help="restore the latest deployment backup")
     rollback_parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)

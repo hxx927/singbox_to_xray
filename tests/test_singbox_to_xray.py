@@ -233,6 +233,17 @@ class ConverterTests(unittest.TestCase):
             ["deploy", "--interactive", "--strict", "--apply", "--stop-source-services"]
         )
 
+    def test_menu_can_revoke_source_clients(self):
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", side_effect=["6\n", "REVOKE\n", "0\n"]
+        ), mock.patch.object(converter, "run_menu_action", return_value=0) as action, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            exit_code = converter.command_menu(argparse.Namespace())
+
+        self.assertEqual(exit_code, 0)
+        action.assert_called_once_with(["revoke-source-clients"])
+
     def test_port_conflict_guidance_for_embedded_sui(self):
         message = converter.port_conflict_guidance({50965: "sui"})
 
@@ -455,6 +466,171 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(state["status"], "manual_sync_required")
         self.assertIn("requires manual acceptance", stderr.getvalue())
         self.assertIn("接受 Agent 现状", stderr.getvalue())
+
+    def test_deploy_records_source_client_fingerprints_without_secrets(self):
+        inbound = {
+            "tag": "vless-main",
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {"id": "old-sui-uuid", "email": "sui-user"},
+                ]
+            },
+        }
+
+        records = converter.source_credential_records([inbound])
+
+        serialized = json.dumps(records)
+        self.assertIn("vless-main", records)
+        self.assertNotIn("old-sui-uuid", serialized)
+        self.assertEqual(records["vless-main"]["container"], "clients")
+        self.assertEqual(len(records["vless-main"]["fingerprints"]), 1)
+
+    def test_recovers_source_fingerprints_for_040_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "sing-box.json"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "type": "vless",
+                                "tag": "vless-main",
+                                "listen_port": 443,
+                                "users": [{"uuid": "old-sui-uuid"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            records = converter.recover_legacy_source_credential_records(
+                {
+                    "source": str(source_path),
+                    "source_type": "json",
+                    "deployed_tags": ["vless-main"],
+                },
+                "xray",
+            )
+
+        self.assertEqual(records["vless-main"]["container"], "clients")
+        self.assertEqual(len(records["vless-main"]["fingerprints"]), 1)
+
+    def test_revoke_source_clients_removes_only_recorded_clients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            current = {
+                "inbounds": [
+                    {
+                        "tag": "vless-main",
+                        "protocol": "vless",
+                        "port": 443,
+                        "settings": {
+                            "clients": [
+                                {"id": "old-sui-uuid", "email": "sui-user"},
+                                {"id": "mmwx-admin-uuid", "email": "admin"},
+                                {"id": "package-uuid", "email": "alice__vless-main"},
+                            ]
+                        },
+                    }
+                ]
+            }
+            xray_config.write_text(json.dumps(current), encoding="utf-8")
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "xray_config": str(xray_config),
+                        "xray_bin": "xray",
+                        "xray_service": "xray",
+                        "source_credentials": converter.source_credential_records(
+                            [
+                                {
+                                    "tag": "vless-main",
+                                    "protocol": "vless",
+                                    "settings": {
+                                        "clients": [
+                                            {"id": "old-sui-uuid", "email": "sui-user"}
+                                        ]
+                                    },
+                                }
+                            ]
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = converter.build_parser().parse_args(
+                ["revoke-source-clients", "--state-file", str(state_file)]
+            )
+            with mock.patch.object(converter.os, "geteuid", return_value=0), mock.patch.object(
+                converter, "validate_xray_config"
+            ), mock.patch.object(converter.os, "chown"), mock.patch.object(
+                converter, "service_active", return_value=True
+            ), mock.patch.object(converter, "service_action") as service_action, mock.patch.object(
+                converter, "wait_for_ports", return_value=set()
+            ), contextlib.redirect_stderr(io.StringIO()):
+                exit_code = converter.command_revoke_source_clients(args)
+
+            updated = json.loads(xray_config.read_text(encoding="utf-8"))
+            updated_clients = updated["inbounds"][0]["settings"]["clients"]
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            backup_exists = Path(state["source_client_revoke_backup"]).exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            [client["id"] for client in updated_clients],
+            ["mmwx-admin-uuid", "package-uuid"],
+        )
+        self.assertEqual(state["status"], "source_clients_revoked")
+        self.assertTrue(backup_exists)
+        service_action.assert_called_once_with("xray", "restart")
+
+    def test_revoke_source_clients_requires_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            source = {
+                "tag": "vless-main",
+                "protocol": "vless",
+                "settings": {"clients": [{"id": "old-sui-uuid"}]},
+            }
+            xray_config.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                **source,
+                                "port": 443,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "xray_config": str(xray_config),
+                        "source_credentials": converter.source_credential_records([source]),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = converter.build_parser().parse_args(
+                ["revoke-source-clients", "--state-file", str(state_file)]
+            )
+            with mock.patch.object(converter.os, "geteuid", return_value=0):
+                with self.assertRaisesRegex(converter.MigrationError, "no replacement"):
+                    converter.command_revoke_source_clients(args)
+
+            self.assertEqual(
+                json.loads(xray_config.read_text(encoding="utf-8"))["inbounds"][0]["settings"]["clients"],
+                [{"id": "old-sui-uuid"}],
+            )
 
     def test_rollback_restarts_source_service_stopped_by_deploy(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -28,20 +28,21 @@ curl -fsSL https://raw.githubusercontent.com/hxx927/singbox_to_xray/main/install
 安装器同时创建短命令 `/usr/local/bin/s-x`。root 用户直接输入 `s-x`，普通用户输入 `sudo s-x`，即可打开中文交互菜单：
 
 ```text
-singbox_to_xray 0.4.x
+singbox_to_xray 0.4.1
 ========================================
   1. 查看数据源与可迁移入站
   2. 安全预检（推荐，不写入）
   3. 选择数据源后预检
   4. 隔离端口预检
   5. 正式迁移到 Xray（可自动停止旧 Core）
-  6. 回滚最近一次迁移
-  7. 显示命令帮助
+  6. 删除原 S-UI client（需先确认新节点正常）
+  7. 回滚最近一次迁移
+  8. 显示命令帮助
   0. 退出
 ========================================
 ```
 
-正式迁移必须手动输入 `APPLY`，回滚必须输入 `ROLLBACK`。正式迁移还会单独询问是否自动停止占用目标端口的 `s-ui`/`sing-box`；脚本不会停止无法识别的进程，也不会绕过端口占用检查。原来的 `singbox-to-xray deploy ...` 参数式命令继续保留，适合自动化执行。
+正式迁移必须手动输入 `APPLY`，删除旧 client 必须输入 `REVOKE`，回滚必须输入 `ROLLBACK`。正式迁移还会单独询问是否自动停止占用目标端口的 `s-ui`/`sing-box`；脚本不会停止无法识别的进程，也不会绕过端口占用检查。原来的 `singbox-to-xray deploy ...` 参数式命令继续保留，适合自动化执行。
 
 也可以直接克隆运行：
 
@@ -152,6 +153,16 @@ Xray 配置尚未写入，请按下面步骤处理：
 ```
 
 支持 `/api/remote/sync-nodes` 的主控可以配合 `--notify-master` 自动确认，此时状态才会变为 `synced`。主控返回 404 不再导致整个迁移失败，脚本会记录 `manual_sync_required` 并显示上述操作步骤。
+
+## 删除原 S-UI client
+
+迁移完成后，脚本会在状态文件中只保存原 client 的 SHA-256 指纹，不保存 UUID 或密码明文。完成“扫描远程服务 → 接受 Agent 现状”后，确认 Xray 管理员节点和用户套餐节点都能真实连接，再执行：
+
+```bash
+sudo singbox-to-xray revoke-source-clients
+```
+
+或在 `sudo s-x` 中选择 `6` 并输入 `REVOKE`。脚本会先确认当前 inbound 仍有至少一个替代 client，创建吊销前备份，通过 `xray -test` 后才原子写入并重启 Xray。它只删除迁移时记录的原 S-UI client，不修改 miaomiaowuX 节点管理、套餐绑定或主控数据；TCPing 正常不等于真实认证成功，吊销后应分别测试旧 S-UI、管理员和套餐节点。
 
 ## 已有同 tag 入站时复测
 

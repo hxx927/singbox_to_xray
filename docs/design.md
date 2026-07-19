@@ -6,7 +6,7 @@
 
 脚本不迁移 S-UI 的数据库、流量历史、套餐关系、路由、DNS 和出站。转换边界与[迁移教程](migration-guide.md)一致。
 
-安装器额外创建 `s-x` 快捷命令。无参数运行时进入交互菜单；菜单内部仍调用同一组 `inspect`、`deploy` 和 `rollback` 处理函数，因此交互模式与参数模式共享完全相同的校验、备份和回滚边界。
+安装器额外创建 `s-x` 快捷命令。无参数运行时进入交互菜单；菜单内部仍调用同一组 `inspect`、`deploy`、`revoke-source-clients` 和 `rollback` 处理函数，因此交互模式与参数模式共享完全相同的校验、备份和回滚边界。
 
 ## 实际链路
 
@@ -61,6 +61,14 @@ python3 singbox_to_xray.py deploy \
 ```bash
 python3 singbox_to_xray.py rollback --notify-master
 ```
+
+迁移后先完成主控的“扫描远程服务 → 接受 Agent 现状”，并真实验证管理员和套餐节点，再吊销原 S-UI client：
+
+```bash
+python3 singbox_to_xray.py revoke-source-clients
+```
+
+吊销只在 Agent 本机执行：部署时保存源 client 的 SHA-256 指纹，吊销前确认 inbound 仍有替代 client，备份并测试 Xray 配置后原子写盘和重启。它不调用主控接口，也不更新节点管理 UUID；旧 `0.4.0` 状态会从记录的源数据库回填指纹。
 
 ## 转换范围
 

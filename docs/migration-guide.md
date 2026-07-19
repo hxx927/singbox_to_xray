@@ -8,7 +8,7 @@ S-UI 1.5.x 把入站、TLS 和客户端信息保存在 SQLite 数据库中，并
 
 脚本默认检测 `/usr/local/s-ui/db/s-ui.db`。数据库中存在入站时，它优先读取该数据库；只有 S-UI 数据库没有入站时，才回退到普通 sing-box JSON。可以先执行以下 dry-run 确认日志中的 `[SOURCE]`：
 
-安装后可以运行 `sudo s-x` 打开中文交互菜单，选择 `1` 查看入站，选择 `2` 执行推荐的安全预检。正式迁移和回滚分别要求输入 `APPLY` 和 `ROLLBACK`，避免误操作。
+安装后可以运行 `sudo s-x` 打开中文交互菜单，选择 `1` 查看入站，选择 `2` 执行推荐的安全预检。正式迁移、旧 client 吊销和回滚分别要求输入 `APPLY`、`REVOKE` 和 `ROLLBACK`，避免误操作。
 
 ```bash
 sudo singbox-to-xray deploy --strict
@@ -484,6 +484,14 @@ sudo python3 singbox_to_xray.py deploy --apply --stop-source-services
 ```
 
 迁移后按脚本提示进入服务管理扫描并接受 Agent 现状；节点出现在节点管理且 TCPing 有延迟后，链路才算完整。面板确认前状态文件中的 `status` 为 `manual_sync_required`；只有自动同步接口返回实际 `node_tags` 时才是 `synced`。
+
+确认管理员节点和用户套餐节点都能真实连接后，再删除迁移时保留的原 S-UI client：
+
+```bash
+sudo singbox-to-xray revoke-source-clients
+```
+
+也可以在 `sudo s-x` 中选择 `6` 并输入 `REVOKE`。该步骤只修改 Agent 机器当前 Xray 的 `settings.clients`/`settings.accounts`，不修改节点管理中的基础 UUID、节点 ID、套餐绑定或主控数据。脚本只删除迁移时记录的源 client 指纹，先备份并运行 `xray -test`；没有检测到替代 client 时会拒绝写盘。旧 `0.4.0` 生成的状态文件也会从原 S-UI 数据库回填指纹。
 
 完整安全约束、协议覆盖和 Agent/主控链路见 [脚本设计文档](design.md)。
 
