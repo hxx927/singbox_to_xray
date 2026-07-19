@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import sqlite3
 import stat
@@ -1049,27 +1048,51 @@ def post_migration_guidance(*, sync_confirmed: bool, stopped_services: Iterable[
     return "\n".join(lines)
 
 
-def manual_admin_node_guidance(config_path: Path, tags: Iterable[str]) -> str:
+def _client_credential_value(client: Any) -> str:
+    if not isinstance(client, dict):
+        return "<no-credential>"
+    for key in ("id", "password", "auth", "pass"):
+        value = nonempty_string(client.get(key))
+        if value:
+            return value
+    return "<no-credential>"
+
+
+def manual_admin_node_guidance(config: dict[str, Any], tags: Iterable[str]) -> str:
     lines = [
         "",
         "管理员节点手动切换：",
         "REVOKE 只删除 Xray 中的原 S-UI client，不会修改 miaomiaowuX 节点管理。",
-        "请在服务器本地运行下面的命令，第一列是 client 标签，第二列是对应凭据：",
+        "下面是各入站当前保留的 client 和凭据（敏感信息，请勿公开）：",
     ]
-    jq_filter = (
-        '.inbounds[] | select(.tag == $tag) | .settings.clients[] | '
-        '[(.email // .user // "<unlabeled>"), '
-        '(.id // .password // .auth // .pass // "<no-credential>")] | @tsv'
-    )
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list):
+        inbounds = []
+    by_tag = {
+        nonempty_string(inbound.get("tag")): inbound
+        for inbound in inbounds
+        if isinstance(inbound, dict) and nonempty_string(inbound.get("tag"))
+    }
     for tag in sorted(set(tags)):
-        command = (
-            f"sudo jq -r --arg tag {shlex.quote(tag)} "
-            f"{shlex.quote(jq_filter)} {shlex.quote(str(config_path))}"
-        )
-        lines.extend([f"- {tag}：", f"  {command}"])
+        lines.append(f"- {tag}：")
+        inbound = by_tag.get(tag)
+        settings = inbound.get("settings") if isinstance(inbound, dict) else None
+        clients: list[Any] = []
+        if isinstance(settings, dict):
+            for container in ("clients", "accounts"):
+                entries = settings.get(container)
+                if isinstance(entries, list):
+                    clients.extend(entries)
+        if not clients:
+            lines.append("  <没有可显示的 client>")
+            continue
+        for client in clients:
+            label = json.dumps(_client_display_label(client), ensure_ascii=False)
+            credential = json.dumps(_client_credential_value(client), ensure_ascii=False)
+            lines.append(f"  client={label}  credential={credential}")
     lines.extend(
         [
-            "找到管理员 client（例如 黑西西）后，复制它对应的第二列值。",
+            "找到管理员 client（例如 黑西西）后，复制它对应的 credential 值（不要复制两侧引号）。",
             "在 miaomiaowuX「节点管理」中打开同 tag 节点的 Clash 配置详情：",
             "- VLESS/VMess：只把 uuid 改为管理员 client 的值。",
             "- Trojan/Hysteria：只把 password 改为管理员 client 的值。",
@@ -1807,7 +1830,7 @@ def command_revoke_source_clients(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     print(
-        manual_admin_node_guidance(config_path, removed),
+        manual_admin_node_guidance(candidate, removed),
         file=sys.stderr,
     )
     return 0

@@ -281,12 +281,29 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("TCPing", message)
         self.assertIn("没有修改其开机启动状态", message)
 
-    def test_manual_admin_node_guidance_prints_safe_jq_command(self):
+    def test_manual_admin_node_guidance_prints_remaining_credentials(self):
         message = converter.manual_admin_node_guidance(
-            Path("/usr/local/etc/xray/config.json"), ["vless-50965"]
+            {
+                "inbounds": [
+                    {
+                        "tag": "vless-50965",
+                        "settings": {
+                            "clients": [
+                                {"email": "黑西西", "id": "admin-uuid"},
+                                {
+                                    "email": "TEST__vless-50965",
+                                    "id": "package-uuid",
+                                },
+                            ]
+                        },
+                    }
+                ]
+            },
+            ["vless-50965"],
         )
 
-        self.assertIn("jq -r --arg tag vless-50965", message)
+        self.assertIn('client="黑西西"  credential="admin-uuid"', message)
+        self.assertIn('client="TEST__vless-50965"  credential="package-uuid"', message)
         self.assertIn("黑西西", message)
         self.assertIn("只把 uuid", message)
         self.assertIn("不要删除 Xray 入站", message)
