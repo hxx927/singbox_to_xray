@@ -180,19 +180,99 @@ class ConverterTests(unittest.TestCase):
             "s-ui-db",
             Path("s-ui.db"),
         )
-        output = io.StringIO()
-        with mock.patch.object(converter, "resolve_source", return_value=source), contextlib.redirect_stdout(
-            output
-        ):
-            exit_code = converter.command_inspect(argparse.Namespace())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            xray_config.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "tag": "vless-main",
+                                "protocol": "vless",
+                                "port": 443,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "status": "source_clients_revoked",
+                        "deployed_tags": ["vless-main"],
+                        "source_clients_revoked": {"vless-main": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            args = argparse.Namespace(
+                xray_config=str(xray_config), state_file=str(state_file)
+            )
+            with mock.patch.object(
+                converter, "resolve_source", return_value=source
+            ), contextlib.redirect_stdout(output):
+                exit_code = converter.command_inspect(args)
 
         rendered = output.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("vless-main", rendered)
         self.assertIn("reality", rendered)
+        self.assertIn("已存在于 Xray", rendered)
+        self.assertIn("原 S-UI client 已删除", rendered)
+        available_section = rendered.split("可迁移入站：", 1)[1].split("已存在于 Xray：", 1)[0]
+        self.assertNotIn("vless-main", available_section)
         self.assertNotIn("11111111", rendered)
         self.assertNotIn("secret-password", rendered)
         self.assertNotIn("secret-key", rendered)
+
+    def test_inbound_selection_accepts_lists_and_ranges(self):
+        self.assertEqual(converter.parse_inbound_selection("1,3-4", 4), {1, 3, 4})
+        with self.assertRaisesRegex(converter.MigrationError, "超出范围"):
+            converter.parse_inbound_selection("5", 4)
+
+    def test_classification_rejects_duplicate_tags_and_keeps_unsupported_port(self):
+        source = {
+            "inbounds": [
+                {"type": "vless", "tag": "duplicate", "listen_port": 10001},
+                {"type": "vless", "tag": "duplicate", "listen_port": 10002},
+                {"type": "tuic", "tag": "unsupported", "listen_port": 10003},
+            ]
+        }
+
+        statuses = converter.classify_source_inbounds(source, {})
+
+        self.assertEqual([status.category for status in statuses], ["invalid", "invalid", "unsupported"])
+        self.assertEqual([status.source_port for status in statuses], [10001, 10002, 10003])
+        self.assertIn("重复 tag", statuses[0].detail)
+
+    def test_interactive_inbound_selection_can_choose_subset(self):
+        statuses = [
+            converter.SourceInboundStatus(
+                index=index,
+                tag=f"vless-{index}",
+                target_tag=f"vless-{index}",
+                source_protocol="vless",
+                target_protocol="vless",
+                source_port=10000 + index,
+                target_port=10000 + index,
+                network="tcp",
+                security="none",
+                user_count=1,
+                category="available" if index != 2 else "existing",
+                detail="可迁移" if index != 2 else "Xray 中已有匹配入站",
+            )
+            for index in range(1, 4)
+        ]
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", side_effect=["2\n", "1,3\n"]
+        ), contextlib.redirect_stderr(io.StringIO()):
+            selected = converter.choose_source_inbound_tags(statuses)
+
+        self.assertEqual(selected, {"vless-1", "vless-3"})
 
     def test_menu_safe_preflight_and_exit(self):
         output = io.StringIO()
@@ -204,7 +284,7 @@ class ConverterTests(unittest.TestCase):
             exit_code = converter.command_menu(argparse.Namespace())
 
         self.assertEqual(exit_code, 0)
-        action.assert_called_once_with(["deploy", "--strict"])
+        action.assert_called_once_with(["deploy", "--strict", "--select-inbounds"])
         self.assertIn("安全预检", output.getvalue())
 
     def test_menu_cancelled_apply_does_not_run_action(self):
@@ -230,7 +310,14 @@ class ConverterTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         action.assert_called_once_with(
-            ["deploy", "--interactive", "--strict", "--apply", "--stop-source-services"]
+            [
+                "deploy",
+                "--interactive",
+                "--strict",
+                "--select-inbounds",
+                "--apply",
+                "--stop-source-services",
+            ]
         )
 
     def test_menu_can_revoke_source_clients(self):
@@ -268,6 +355,62 @@ class ConverterTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(converter.MigrationError, "unrecognized"):
             converter.source_services_for_conflicts({443: "nginx"})
+
+    def test_partial_port_release_keeps_unselected_ports_online(self):
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", return_value="CHECK\n"
+        ), mock.patch.object(
+            converter, "listening_port_owners", return_value={20002: "sui"}
+        ), contextlib.redirect_stderr(io.StringIO()):
+            converter.wait_for_partial_port_release(
+                {20001: "sui"},
+                selected_tags={"vless-one"},
+                unselected_tags={"vless-two"},
+                unselected_active_ports={20002},
+                interactive=True,
+            )
+
+    def test_partial_port_release_rejects_whole_core_stop(self):
+        with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+            converter.sys.stdin, "readline", return_value="CHECK\n"
+        ), mock.patch.object(
+            converter, "listening_port_owners", return_value={}
+        ), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(converter.MigrationError, "未选入站"):
+                converter.wait_for_partial_port_release(
+                    {20001: "sui"},
+                    selected_tags={"vless-one"},
+                    unselected_tags={"vless-two"},
+                    unselected_active_ports={20002},
+                    interactive=True,
+                )
+
+    def test_pending_migration_blocks_new_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "status": "manual_sync_required",
+                        "deployed_tags": ["vless-main"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(converter.MigrationError, "上一批正式迁移尚未完成"):
+                converter.ensure_no_pending_migration(state_file)
+
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "status": "source_clients_revoked",
+                        "deployed_tags": ["vless-main"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            converter.ensure_no_pending_migration(state_file)
 
     def test_post_migration_guidance_describes_manual_acceptance(self):
         message = converter.post_migration_guidance(
@@ -367,6 +510,71 @@ class ConverterTests(unittest.TestCase):
         service_action.assert_any_call("xray", "restart")
         self.assertNotIn(mock.call("s-ui", "start"), service_action.call_args_list)
         self.assertIn("接受 Agent 现状", stderr.getvalue())
+
+    def test_deploy_interactive_subset_records_only_selected_inbound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sing-box.json"
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "type": "shadowsocks",
+                                "tag": "ss-one",
+                                "listen_port": 12001,
+                                "method": "aes-128-gcm",
+                                "password": "secret-one",
+                            },
+                            {
+                                "type": "shadowsocks",
+                                "tag": "ss-two",
+                                "listen_port": 12002,
+                                "method": "aes-128-gcm",
+                                "password": "secret-two",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            xray_config.write_text('{"inbounds": []}\n', encoding="utf-8")
+            args = converter.build_parser().parse_args(
+                [
+                    "deploy",
+                    "--input",
+                    str(source),
+                    "--xray-config",
+                    str(xray_config),
+                    "--state-file",
+                    str(state_file),
+                    "--strict",
+                    "--select-inbounds",
+                    "--apply",
+                ]
+            )
+            with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
+                converter.sys.stdin, "readline", return_value="2\n"
+            ), mock.patch.object(converter, "validate_xray_config"), mock.patch.object(
+                converter.os, "geteuid", return_value=0
+            ), mock.patch.object(converter.os, "chown"), mock.patch.object(
+                converter, "listening_port_owners", return_value={}
+            ), mock.patch.object(converter, "service_active", return_value=True), mock.patch.object(
+                converter, "service_action"
+            ), mock.patch.object(
+                converter, "wait_for_ports", return_value=set()
+            ), contextlib.redirect_stderr(io.StringIO()):
+                exit_code = converter.command_deploy(args)
+
+            updated = json.loads(xray_config.read_text(encoding="utf-8"))
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([inbound["tag"] for inbound in updated["inbounds"]], ["ss-two"])
+        self.assertEqual(state["source_tags"], ["ss-two"])
+        self.assertEqual(state["deployed_tags"], ["ss-two"])
 
     def test_deploy_restarts_stopped_source_service_after_xray_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -659,6 +867,60 @@ class ConverterTests(unittest.TestCase):
                 json.loads(xray_config.read_text(encoding="utf-8"))["inbounds"][0]["settings"]["clients"],
                 [{"id": "old-sui-uuid"}],
             )
+
+    def test_revoke_marks_batch_complete_when_source_client_is_already_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xray_config = root / "xray.json"
+            state_file = root / "state.json"
+            source_inbound = {
+                "tag": "vless-main",
+                "protocol": "vless",
+                "settings": {"clients": [{"id": "old-sui-uuid"}]},
+            }
+            xray_config.write_text(
+                json.dumps(
+                    {
+                        "inbounds": [
+                            {
+                                "tag": "vless-main",
+                                "protocol": "vless",
+                                "port": 443,
+                                "settings": {
+                                    "clients": [{"id": "admin-uuid", "email": "admin"}]
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "status": "manual_sync_required",
+                        "deployed_tags": ["vless-main"],
+                        "xray_config": str(xray_config),
+                        "source_credentials": converter.source_credential_records(
+                            [source_inbound]
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = converter.build_parser().parse_args(
+                ["revoke-source-clients", "--state-file", str(state_file)]
+            )
+            with mock.patch.object(
+                converter.os, "geteuid", return_value=0
+            ), contextlib.redirect_stderr(io.StringIO()):
+                exit_code = converter.command_revoke_source_clients(args)
+
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(state["status"], "source_clients_revoked")
+        self.assertEqual(state["source_clients_revoked"], {"vless-main": 0})
 
     def test_rollback_restarts_source_service_stopped_by_deploy(self):
         with tempfile.TemporaryDirectory() as directory:

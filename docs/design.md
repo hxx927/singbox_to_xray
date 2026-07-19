@@ -96,11 +96,15 @@ sing-box 服务端通常只有私钥，而 miaomiaowuX 生成订阅节点需要 
 
 - 不覆盖整个 Xray 配置，只修改顶层 `inbounds`，保留 `api`、`stats`、`policy`、`metrics`、路由和出站。
 - 默认拒绝覆盖同 tag 入站；只有显式 `--replace-existing` 才替换。
-- 正式迁移检测到端口由 `sui`/`s-ui` 或 `sing-box` 占用时，可在用户明确确认后停止对应 systemd 服务；其他进程一律拒绝自动停止。
+- `inspect` 按当前 Xray 的 tag、协议和端口把来源分为可迁移、已存在和冲突；保留 S-UI 数据库不等于重复迁移。
+- `--select-inbounds` 与可重复 `--tag` 共用 `ConversionOptions.selected_tags`，单选、多选和全选不会产生不同转换路径。
+- 全量正式迁移检测到端口由 `sui`/`s-ui` 或 `sing-box` 占用时，可在用户明确确认后停止对应 systemd 服务；其他进程一律拒绝自动停止。
+- 部分正式迁移不停止整个旧 Core；交互模式等待用户只停用所选入站，并复查所选端口已释放、未选在线端口仍在监听。
 - 拒绝重复 tag、无效端口、转换后端口碰撞，以及与现有 Xray 入站的端口碰撞。
 - 写盘前必须通过 `xray run -test -config`。
 - 写盘采用同目录临时文件和 `os.replace`，避免进程中断留下半截 JSON。
 - 每次部署创建带时间戳的只读备份，并记录到 root-only 状态文件。
+- 状态文件中存在未 REVOKE/未回滚的批次时拒绝新的正式部署，避免覆盖源 client 指纹。
 - Xray 重启失败时自动恢复备份并再次启动 Xray；部署失败或显式回滚时，脚本停止过的来源服务也会自动重新启动。
 - `--notify-master` 只在 Xray 已确认运行后重启 Agent，并必须收到主控的节点表确认。
 - 自动同步和显式同步按 `server_id` 串行，避免 Agent 重连时并发创建重复节点。

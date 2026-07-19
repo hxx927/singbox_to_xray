@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -103,6 +103,22 @@ class SourceDocument:
     @property
     def label(self) -> str:
         return "S-UI database" if self.kind == "s-ui-db" else "sing-box JSON"
+
+
+@dataclass(frozen=True)
+class SourceInboundStatus:
+    index: int
+    tag: str
+    target_tag: str
+    source_protocol: str
+    target_protocol: str
+    source_port: int | None
+    target_port: int | None
+    network: str
+    security: str
+    user_count: int
+    category: str
+    detail: str
 
 
 def log(level: str, message: str) -> None:
@@ -333,6 +349,288 @@ def source_tag(inbound: dict[str, Any], index: int) -> str:
 def mapped_port(original: int, options: ConversionOptions, context: str) -> int:
     target = options.port_map.get(original, original + options.port_offset)
     return parse_port(target, context)
+
+
+def target_protocol_for_source(protocol: str) -> str:
+    return "hysteria" if protocol == "hysteria2" else protocol
+
+
+def source_transport_security(inbound: dict[str, Any]) -> tuple[str, str]:
+    network = "tcp"
+    transport = inbound.get("transport")
+    if isinstance(transport, dict):
+        network = nonempty_string(transport.get("type")) or "tcp"
+    security = "none"
+    tls = inbound.get("tls")
+    if isinstance(tls, dict) and tls.get("enabled", True):
+        reality = tls.get("reality")
+        security = (
+            "reality"
+            if isinstance(reality, dict) and reality.get("enabled", True)
+            else "tls"
+        )
+    return network, security
+
+
+def _state_detail_for_existing(state: dict[str, Any], target_tag: str) -> str:
+    deployed_tags = {
+        tag for tag in state.get("deployed_tags", []) if isinstance(tag, str) and tag
+    }
+    if target_tag not in deployed_tags:
+        return "Xray 中已有匹配入站"
+    status = nonempty_string(state.get("status"))
+    revoked = state.get("source_clients_revoked")
+    if status == "source_clients_revoked" and isinstance(revoked, dict) and target_tag in revoked:
+        return "已迁移，原 S-UI client 已删除"
+    if status in {
+        "deploying",
+        "deployed",
+        "reported",
+        "manual_sync_required",
+        "master_sync_failed",
+        "synced",
+        "revoking_source_clients",
+        "source_client_revoke_auto_rolled_back",
+        "source_client_revoke_rollback_failed",
+    }:
+        return "已迁移，原 S-UI client 尚未确认删除"
+    return "Xray 中已有匹配入站"
+
+
+def classify_source_inbounds(
+    source_config: dict[str, Any],
+    xray_config: dict[str, Any],
+    options: ConversionOptions | None = None,
+    state: dict[str, Any] | None = None,
+) -> list[SourceInboundStatus]:
+    options = options or ConversionOptions(derive_reality_keys=False)
+    state = state or {}
+    xray_inbounds = xray_config.get("inbounds")
+    if not isinstance(xray_inbounds, list):
+        xray_inbounds = []
+    xray_by_tag = {
+        nonempty_string(inbound.get("tag")): inbound
+        for inbound in xray_inbounds
+        if isinstance(inbound, dict) and nonempty_string(inbound.get("tag"))
+    }
+
+    raw_inbounds = source_config.get("inbounds")
+    if not isinstance(raw_inbounds, list):
+        return []
+    tag_counts: dict[str, int] = {}
+    for zero_index, raw in enumerate(raw_inbounds):
+        if isinstance(raw, dict):
+            tag = source_tag(raw, zero_index)
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+    statuses: list[SourceInboundStatus] = []
+    for zero_index, raw in enumerate(raw_inbounds):
+        if not isinstance(raw, dict):
+            statuses.append(
+                SourceInboundStatus(
+                    index=zero_index + 1,
+                    tag=f"inbound-{zero_index + 1}",
+                    target_tag="",
+                    source_protocol="<invalid>",
+                    target_protocol="",
+                    source_port=None,
+                    target_port=None,
+                    network="<unknown>",
+                    security="<unknown>",
+                    user_count=0,
+                    category="invalid",
+                    detail="入站数据不是对象",
+                )
+            )
+            continue
+
+        tag = source_tag(raw, zero_index)
+        protocol = nonempty_string(raw.get("type")).lower()
+        target_protocol = target_protocol_for_source(protocol)
+        target_tag = tag + options.tag_suffix
+        network, security = source_transport_security(raw)
+        users = raw.get("users")
+        user_count = len(users) if isinstance(users, list) else 0
+        try:
+            source_port = parse_port(raw.get("listen_port"), f"inbound {tag!r}")
+            target_port = mapped_port(source_port, options, f"inbound {tag!r}")
+        except MigrationError as exc:
+            statuses.append(
+                SourceInboundStatus(
+                    zero_index + 1,
+                    tag,
+                    target_tag,
+                    protocol,
+                    target_protocol,
+                    None,
+                    None,
+                    network,
+                    security,
+                    user_count,
+                    "invalid",
+                    str(exc),
+                )
+            )
+            continue
+
+        if tag_counts.get(tag, 0) > 1:
+            statuses.append(
+                SourceInboundStatus(
+                    zero_index + 1,
+                    tag,
+                    target_tag,
+                    protocol or "<unknown>",
+                    target_protocol,
+                    source_port,
+                    target_port,
+                    network,
+                    security,
+                    user_count,
+                    "invalid",
+                    "来源中存在重复 tag，无法按 tag 唯一选择",
+                )
+            )
+            continue
+
+        if protocol not in SUPPORTED_TYPES:
+            statuses.append(
+                SourceInboundStatus(
+                    zero_index + 1,
+                    tag,
+                    target_tag,
+                    protocol or "<unknown>",
+                    target_protocol,
+                    source_port,
+                    target_port,
+                    network,
+                    security,
+                    user_count,
+                    "unsupported",
+                    "协议不支持转换",
+                )
+            )
+            continue
+
+        existing = xray_by_tag.get(target_tag)
+        if not isinstance(existing, dict):
+            category = "available"
+            detail = "可迁移"
+        else:
+            existing_protocol = nonempty_string(existing.get("protocol")).lower()
+            try:
+                existing_port = parse_port(existing.get("port"), f"Xray inbound {target_tag!r}")
+            except MigrationError:
+                existing_port = None
+            if existing_protocol == target_protocol and existing_port == target_port:
+                category = "existing"
+                detail = _state_detail_for_existing(state, target_tag)
+            else:
+                category = "conflict"
+                detail = (
+                    "Xray 同 tag 入站不匹配："
+                    f"{existing_protocol or '<unknown>'}/{existing_port or '<invalid>'}"
+                )
+        statuses.append(
+            SourceInboundStatus(
+                zero_index + 1,
+                tag,
+                target_tag,
+                protocol,
+                target_protocol,
+                source_port,
+                target_port,
+                network,
+                security,
+                user_count,
+                category,
+                detail,
+            )
+        )
+    return statuses
+
+
+def format_source_inbound_status(status: SourceInboundStatus) -> str:
+    target = f" -> {status.target_tag}" if status.target_tag != status.tag else ""
+    port: Any = status.source_port if status.source_port is not None else "<unknown>"
+    if status.target_port is not None and status.target_port != status.source_port:
+        port = f"{port}->{status.target_port}"
+    return (
+        f"{status.index}. {status.tag}{target} | {status.source_protocol} | 端口 {port} | "
+        f"{status.network} + {status.security} | 用户 {status.user_count} | {status.detail}"
+    )
+
+
+def parse_inbound_selection(value: str, maximum: int) -> set[int]:
+    selected: set[int] = set()
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            raise MigrationError("选择中包含空编号")
+        if "-" in token:
+            left, right = token.split("-", 1)
+            if not left.isdigit() or not right.isdigit():
+                raise MigrationError(f"无效范围：{token}")
+            start, end = int(left), int(right)
+            if start > end:
+                raise MigrationError(f"范围起点不能大于终点：{token}")
+            selected.update(range(start, end + 1))
+        elif token.isdigit():
+            selected.add(int(token))
+        else:
+            raise MigrationError(f"无效编号：{token}")
+    invalid = sorted(index for index in selected if index < 1 or index > maximum)
+    if invalid:
+        raise MigrationError("编号超出范围：" + ", ".join(str(index) for index in invalid))
+    return selected
+
+
+def choose_source_inbound_tags(
+    statuses: list[SourceInboundStatus], *, allow_existing: bool = False
+) -> set[str]:
+    if not sys.stdin.isatty():
+        raise MigrationError("interactive inbound selection requires a terminal")
+    selectable_categories = {"available"}
+    if allow_existing:
+        selectable_categories.update({"existing", "conflict"})
+    selectable = {
+        status.index: status
+        for status in statuses
+        if status.category in selectable_categories
+    }
+    if not selectable:
+        raise MigrationError("没有可选择的入站；请先查看已迁移或冲突状态")
+
+    print("\n请选择要转换的入站：", file=sys.stderr)
+    for status in statuses:
+        marker = "可选" if status.index in selectable else "不可选"
+        print(f"  {format_source_inbound_status(status)} [{marker}]", file=sys.stderr)
+    print(
+        "输入单个编号、逗号列表或范围（例如 2、1,3、1-3）；直接回车选择全部可选入站，0 取消。",
+        file=sys.stderr,
+    )
+    while True:
+        print("选择：", end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+        if answer == "":
+            raise MigrationError("interactive inbound selection was cancelled")
+        answer = answer.strip()
+        if answer == "0":
+            raise MigrationError("已取消入站选择")
+        if not answer:
+            return {status.tag for status in selectable.values()}
+        try:
+            indexes = parse_inbound_selection(answer, len(statuses))
+        except MigrationError as exc:
+            print(str(exc), file=sys.stderr)
+            continue
+        unavailable = sorted(index for index in indexes if index not in selectable)
+        if unavailable:
+            print(
+                "以下编号当前不可选：" + ", ".join(str(index) for index in unavailable),
+                file=sys.stderr,
+            )
+            continue
+        return {selectable[index].tag for index in indexes}
 
 
 def client_email(user: dict[str, Any], tag: str, index: int) -> str:
@@ -995,6 +1293,117 @@ def source_services_for_conflicts(conflicts: dict[int, str]) -> list[str]:
     return sorted(services)
 
 
+def source_ports_by_tag(source_config: dict[str, Any]) -> dict[str, int]:
+    raw_inbounds = source_config.get("inbounds")
+    if not isinstance(raw_inbounds, list):
+        return {}
+    result: dict[str, int] = {}
+    for index, raw in enumerate(raw_inbounds):
+        if not isinstance(raw, dict):
+            continue
+        tag = source_tag(raw, index)
+        try:
+            result[tag] = parse_port(raw.get("listen_port"), f"inbound {tag!r}")
+        except MigrationError:
+            continue
+    return result
+
+
+def selected_source_tags(source_config: dict[str, Any], options: ConversionOptions) -> set[str]:
+    if options.selected_tags:
+        return set(options.selected_tags)
+    raw_inbounds = source_config.get("inbounds")
+    if not isinstance(raw_inbounds, list):
+        return set()
+    return {
+        source_tag(raw, index)
+        for index, raw in enumerate(raw_inbounds)
+        if isinstance(raw, dict)
+        and nonempty_string(raw.get("type")).lower() in SUPPORTED_TYPES
+    }
+
+
+def partial_port_conflict_guidance(
+    conflicts: dict[int, str], selected_tags: set[str], unselected_tags: set[str]
+) -> str:
+    detail = ", ".join(f"{port}({owner})" for port, owner in sorted(conflicts.items()))
+    return "\n".join(
+        [
+            f"检测到部分迁移，所选端口仍由旧 Core 占用：{detail}",
+            "脚本不会停止整个 s-ui/sing-box；否则未选节点也会掉线，旧 Core 也无法直接重启。",
+            "所选入站：" + ", ".join(sorted(selected_tags)),
+            "未选入站：" + (", ".join(sorted(unselected_tags)) or "无"),
+            "请在 S-UI/旧 sing-box 中只停用所选入站并应用配置，不要停止整个服务。",
+            "完成后回到当前终端输入 CHECK；脚本会确认所选端口已释放，并检查原本在线的未选端口仍在监听。",
+        ]
+    )
+
+
+def wait_for_partial_port_release(
+    conflicts: dict[int, str],
+    *,
+    selected_tags: set[str],
+    unselected_tags: set[str],
+    unselected_active_ports: set[int],
+    interactive: bool,
+) -> None:
+    guidance = partial_port_conflict_guidance(conflicts, selected_tags, unselected_tags)
+    if not interactive or not sys.stdin.isatty():
+        raise MigrationError(guidance + "\n非交互模式请处理完成后重新执行命令。")
+    print("\n" + guidance, file=sys.stderr)
+    selected_ports = set(conflicts)
+    while True:
+        print("输入 CHECK 重新检测，其他内容取消：", end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+        if answer == "" or answer.strip() != "CHECK":
+            raise MigrationError("已取消部分迁移，Xray 配置未写入")
+        active = listening_port_owners()
+        remaining = {port: active[port] for port in selected_ports if port in active}
+        if remaining:
+            detail = ", ".join(
+                f"{port}({owner})" for port, owner in sorted(remaining.items())
+            )
+            print(f"所选端口仍被占用：{detail}", file=sys.stderr)
+            continue
+        lost_unselected = sorted(port for port in unselected_active_ports if port not in active)
+        if lost_unselected:
+            raise MigrationError(
+                "未选入站原本在线的端口已停止监听："
+                + ", ".join(str(port) for port in lost_unselected)
+                + "；疑似停止了整个旧 Core，拒绝写入 Xray"
+            )
+        log("OK", "selected ports were released while unselected active ports stayed online")
+        return
+
+
+RESOLVED_MIGRATION_STATES = {
+    "source_clients_revoked",
+    "auto_rolled_back",
+    "rolled_back",
+    "rolled_back_synced",
+}
+
+
+def ensure_no_pending_migration(state_path: Path) -> None:
+    if not state_path.exists():
+        return
+    state = load_json(state_path)
+    status = nonempty_string(state.get("status"))
+    if status in RESOLVED_MIGRATION_STATES:
+        return
+    deployed_tags = [
+        tag for tag in state.get("deployed_tags", []) if isinstance(tag, str) and tag
+    ]
+    if not status and not deployed_tags:
+        return
+    detail = ", ".join(deployed_tags) or "<unknown>"
+    raise MigrationError(
+        "上一批正式迁移尚未完成，拒绝覆盖状态文件："
+        f"status={status or '<unknown>'}, tags={detail}。"
+        "请先执行菜单 6 完成 REVOKE，或执行菜单 7 回滚。"
+    )
+
+
 def wait_for_ports_released(ports: set[int], timeout: int = 12) -> dict[int, str]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1511,39 +1920,47 @@ def report_conversion(result: ConversionResult) -> None:
         log("SKIP", skipped)
 
 
+def load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return load_json(path)
+
+
 def command_inspect(args: argparse.Namespace) -> int:
     source = resolve_source(args)
-    inbounds = source.config.get("inbounds", [])
-    print(f"\n可迁移入站（来源：{source.label}）：")
-    for index, inbound in enumerate(inbounds, 1):
-        if not isinstance(inbound, dict):
-            print(f"  {index}. <invalid inbound>")
+    xray_path = Path(getattr(args, "xray_config", DEFAULT_XRAY_CONFIG))
+    state_path = Path(getattr(args, "state_file", DEFAULT_STATE_FILE))
+    xray_config = load_optional_json(xray_path)
+    state = load_optional_json(state_path)
+    statuses = classify_source_inbounds(source.config, xray_config, state=state)
+
+    print(f"\n入站状态（来源：{source.label}）：")
+    sections = [
+        ("可迁移入站", {"available"}),
+        ("已存在于 Xray", {"existing"}),
+        ("冲突入站", {"conflict"}),
+        ("不支持或无效", {"unsupported", "invalid"}),
+    ]
+    for title, categories in sections:
+        matches = [status for status in statuses if status.category in categories]
+        print(f"\n{title}：")
+        if not matches:
+            print("  （无）")
             continue
-        inbound_type = nonempty_string(inbound.get("type")) or "<unknown>"
-        tag = source_tag(inbound, index - 1)
-        port = inbound.get("listen_port", "<unknown>")
-        transport = inbound.get("transport")
-        network = "tcp"
-        if isinstance(transport, dict):
-            network = nonempty_string(transport.get("type")) or "tcp"
-        tls = inbound.get("tls")
-        security = "none"
-        if isinstance(tls, dict) and tls.get("enabled", True):
-            reality = tls.get("reality")
-            security = "reality" if isinstance(reality, dict) and reality.get("enabled", True) else "tls"
-        users = inbound.get("users")
-        user_count = len(users) if isinstance(users, list) else 0
-        supported = "支持" if inbound_type.lower() in SUPPORTED_TYPES else "不支持"
-        print(
-            f"  {index}. {tag} | {inbound_type} | 端口 {port} | "
-            f"{network} + {security} | 用户 {user_count} | {supported}"
-        )
+        for status in matches:
+            print(f"  {format_source_inbound_status(status)}")
     return 0
 
 
 def command_convert(args: argparse.Namespace) -> int:
     source = resolve_source(args)
-    result = convert_config(source.config, make_options(args))
+    options = make_options(args)
+    if getattr(args, "select_inbounds", False):
+        if options.selected_tags:
+            raise MigrationError("--select-inbounds cannot be combined with --tag")
+        statuses = classify_source_inbounds(source.config, {}, options=options)
+        options.selected_tags = choose_source_inbound_tags(statuses)
+    result = convert_config(source.config, options)
     report_conversion(result)
     payload: Any = result.inbounds if args.array else {"inbounds": result.inbounds}
     output = json_text(payload)
@@ -1559,7 +1976,15 @@ def command_deploy(args: argparse.Namespace) -> int:
     source = resolve_source(args)
     config_path = Path(args.xray_config)
     current = load_json(config_path)
-    result = convert_config(source.config, make_options(args))
+    options = make_options(args)
+    if getattr(args, "select_inbounds", False):
+        if options.selected_tags:
+            raise MigrationError("--select-inbounds cannot be combined with --tag")
+        statuses = classify_source_inbounds(source.config, current, options=options)
+        options.selected_tags = choose_source_inbound_tags(
+            statuses, allow_existing=args.replace_existing
+        )
+    result = convert_config(source.config, options)
     merged = merge_inbounds(current, result.inbounds, args.replace_existing)
     report_conversion(result)
 
@@ -1579,24 +2004,50 @@ def command_deploy(args: argparse.Namespace) -> int:
     if os.geteuid() != 0:
         raise MigrationError("deploy --apply must run as root")
 
+    state_path = Path(args.state_file)
+    ensure_no_pending_migration(state_path)
     desired_ports = {int(inbound["port"]) for inbound in result.inbounds}
+    source_ports = source_ports_by_tag(source.config)
+    selected_tags = selected_source_tags(source.config, options)
+    all_source_tags = set(source_ports)
+    unselected_tags = all_source_tags - selected_tags
+    partial_selection = bool(unselected_tags)
+    if partial_selection and args.allow_active_port:
+        raise MigrationError("部分迁移禁止使用 --allow-active-port 绕过端口检查")
     source_services: list[str] = []
     if not args.allow_active_port:
         active = listening_port_owners()
         conflicts = {port: active[port] for port in desired_ports if port in active and active[port] != "xray"}
         if conflicts:
+            source_owned = all(source_service_for_owner(owner) for owner in conflicts.values())
+            if partial_selection and source_owned:
+                unselected_active_ports = {
+                    port
+                    for tag, port in source_ports.items()
+                    if tag in unselected_tags and port in active
+                }
+                wait_for_partial_port_release(
+                    conflicts,
+                    selected_tags=selected_tags,
+                    unselected_tags=unselected_tags,
+                    unselected_active_ports=unselected_active_ports,
+                    interactive=getattr(args, "select_inbounds", False),
+                )
+                conflicts = {}
             if not args.stop_source_services:
-                raise MigrationError(port_conflict_guidance(conflicts))
-            try:
-                source_services = source_services_for_conflicts(conflicts)
-            except MigrationError as exc:
-                raise MigrationError(f"{exc}\n{port_conflict_guidance(conflicts)}") from exc
+                if conflicts:
+                    raise MigrationError(port_conflict_guidance(conflicts))
+            elif conflicts:
+                try:
+                    source_services = source_services_for_conflicts(conflicts)
+                except MigrationError as exc:
+                    raise MigrationError(f"{exc}\n{port_conflict_guidance(conflicts)}") from exc
 
     config_stat = config_path.stat()
     backup = backup_config(config_path)
     stopped_source_services: list[str] = []
     state = {
-        "version": 2,
+        "version": 3,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "source": str(source.path),
         "source_type": source.kind,
@@ -1608,11 +2059,12 @@ def command_deploy(args: argparse.Namespace) -> int:
         "agent_config": args.agent_config,
         "deployed_tags": [item["tag"] for item in result.inbounds],
         "deployed_ports": sorted(desired_ports),
+        "source_tags": sorted(selected_tags),
         "source_credentials": source_credential_records(result.inbounds),
         "source_services_to_stop": source_services,
         "status": "deploying",
     }
-    write_state(Path(args.state_file), state)
+    write_state(state_path, state)
 
     try:
         for service in source_services:
@@ -1626,7 +2078,7 @@ def command_deploy(args: argparse.Namespace) -> int:
             if remaining_conflicts:
                 raise MigrationError(port_conflict_guidance(remaining_conflicts))
             state["stopped_source_services"] = stopped_source_services
-            write_state(Path(args.state_file), state)
+            write_state(state_path, state)
             log("OK", "source service stopped and target port(s) released")
 
         atomic_write(
@@ -1659,13 +2111,13 @@ def command_deploy(args: argparse.Namespace) -> int:
                 log("OK", f"restarted source service {service} after deployment failure")
             except MigrationError as restart_exc:
                 recovery_errors.append(f"failed to restart {service}: {restart_exc}")
-        write_state(Path(args.state_file), state)
+        write_state(state_path, state)
         if recovery_errors:
             raise MigrationError(f"deployment failed: {exc}; {'; '.join(recovery_errors)}") from exc
         raise MigrationError(f"deployment failed and was rolled back: {exc}") from exc
 
     state["status"] = "deployed"
-    write_state(Path(args.state_file), state)
+    write_state(state_path, state)
     log("OK", f"deployed {len(result.inbounds)} inbound(s); backup={backup}")
 
     if args.notify_master:
@@ -1681,7 +2133,7 @@ def command_deploy(args: argparse.Namespace) -> int:
             )
         state["status"] = "reported"
         state["reported_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        write_state(Path(args.state_file), state)
+        write_state(state_path, state)
         log("OK", f"Agent reported scan_result with at least {expected_count} managed inbound(s)")
         try:
             sync_result = request_master_node_sync(
@@ -1692,7 +2144,7 @@ def command_deploy(args: argparse.Namespace) -> int:
         except MasterSyncUnavailable as exc:
             state["status"] = "manual_sync_required"
             state["master_sync_error"] = str(exc)
-            write_state(Path(args.state_file), state)
+            write_state(state_path, state)
             log("WARN", "Xray migration and Agent scan succeeded; this master requires manual acceptance")
             print(
                 post_migration_guidance(
@@ -1704,7 +2156,7 @@ def command_deploy(args: argparse.Namespace) -> int:
         except MigrationError as exc:
             state["status"] = "master_sync_failed"
             state["master_sync_error"] = str(exc)
-            write_state(Path(args.state_file), state)
+            write_state(state_path, state)
             print(
                 post_migration_guidance(
                     sync_confirmed=False, stopped_services=stopped_source_services
@@ -1718,7 +2170,7 @@ def command_deploy(args: argparse.Namespace) -> int:
         state["master_server_name"] = sync_result.get("server_name")
         state["node_tags"] = sync_result.get("node_tags", [])
         state.pop("master_sync_error", None)
-        write_state(Path(args.state_file), state)
+        write_state(state_path, state)
         log("OK", f"master confirmed node tag(s): {', '.join(state['deployed_tags'])}")
         print(
             post_migration_guidance(
@@ -1728,7 +2180,7 @@ def command_deploy(args: argparse.Namespace) -> int:
         )
     else:
         state["status"] = "manual_sync_required"
-        write_state(Path(args.state_file), state)
+        write_state(state_path, state)
         print(
             post_migration_guidance(
                 sync_confirmed=False, stopped_services=stopped_source_services
@@ -1761,6 +2213,12 @@ def command_revoke_source_clients(args: argparse.Namespace) -> int:
         print(inventory, file=sys.stderr)
     candidate, removed = remove_recorded_source_clients(current, records)
     if not removed:
+        state["status"] = "source_clients_revoked"
+        state["source_clients_revoked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        state["source_clients_revoked"] = {
+            tag: 0 for tag in records if isinstance(tag, str) and tag
+        }
+        write_state(state_path, state)
         log("OK", "recorded source clients are already absent; no configuration change was needed")
         return 0
 
@@ -1961,9 +2419,11 @@ singbox_to_xray {VERSION}
             if choice == "1":
                 run_menu_action(["inspect", "--interactive"])
             elif choice == "2":
-                run_menu_action(["deploy", "--strict"])
+                run_menu_action(["deploy", "--strict", "--select-inbounds"])
             elif choice == "3":
-                run_menu_action(["deploy", "--interactive", "--strict"])
+                run_menu_action(
+                    ["deploy", "--interactive", "--strict", "--select-inbounds"]
+                )
             elif choice == "4":
                 offset = menu_prompt("端口偏移量 [10000]：") or "10000"
                 try:
@@ -1977,6 +2437,7 @@ singbox_to_xray {VERSION}
                         "deploy",
                         "--interactive",
                         "--strict",
+                        "--select-inbounds",
                         "--port-offset",
                         offset,
                         f"--tag-suffix={suffix}",
@@ -1990,9 +2451,15 @@ singbox_to_xray {VERSION}
                 if menu_prompt("输入 APPLY 继续，其他内容取消：") != "APPLY":
                     print("已取消正式迁移。")
                     continue
-                command = ["deploy", "--interactive", "--strict", "--apply"]
+                command = [
+                    "deploy",
+                    "--interactive",
+                    "--strict",
+                    "--select-inbounds",
+                    "--apply",
+                ]
                 if menu_prompt(
-                    "端口被 s-ui/sing-box 占用时，由脚本自动停止对应服务？[y/N]："
+                    "全量迁移时，端口被旧 Core 占用是否自动停止对应服务？[y/N]："
                 ).lower() in {"y", "yes"}:
                     command.append("--stop-source-services")
                 if menu_prompt("替换 Xray 中同 tag 入站？[y/N]：").lower() in {"y", "yes"}:
@@ -2054,6 +2521,11 @@ def add_source_arguments(parser: argparse.ArgumentParser) -> None:
 def add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
     add_source_arguments(parser)
     parser.add_argument("--tag", action="append", help="convert only this source inbound tag; repeatable")
+    parser.add_argument(
+        "--select-inbounds",
+        action="store_true",
+        help="interactively choose one or more source inbounds",
+    )
     parser.add_argument("--strict", action="store_true", help="fail instead of skipping unsupported inbounds")
     parser.add_argument("--port-offset", type=int, default=0, help="add this value to every source port")
     parser.add_argument("--port-map", action="append", default=[], metavar="OLD=NEW", help="explicit port mapping")
@@ -2085,6 +2557,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_parser = subparsers.add_parser("inspect", help="list source inbounds without secrets")
     add_source_arguments(inspect_parser)
+    inspect_parser.add_argument("--xray-config", default=DEFAULT_XRAY_CONFIG)
+    inspect_parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     inspect_parser.set_defaults(handler=command_inspect)
 
     convert_parser = subparsers.add_parser("convert", help="convert only; never modify Xray")

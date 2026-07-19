@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/hxx927/singbox_to_xray/main/install
 安装器同时创建短命令 `/usr/local/bin/s-x`。root 用户直接输入 `s-x`，普通用户输入 `sudo s-x`，即可打开中文交互菜单：
 
 ```text
-singbox_to_xray 0.4.2
+singbox_to_xray 0.4.4
 ========================================
   1. 查看数据源与可迁移入站
   2. 安全预检（推荐，不写入）
@@ -42,7 +42,7 @@ singbox_to_xray 0.4.2
 ========================================
 ```
 
-正式迁移必须手动输入 `APPLY`，删除旧 client 必须输入 `REVOKE`，回滚必须输入 `ROLLBACK`。正式迁移还会单独询问是否自动停止占用目标端口的 `s-ui`/`sing-box`；脚本不会停止无法识别的进程，也不会绕过端口占用检查。原来的 `singbox-to-xray deploy ...` 参数式命令继续保留，适合自动化执行。
+正式迁移必须手动输入 `APPLY`，删除旧 client 必须输入 `REVOKE`，回滚必须输入 `ROLLBACK`。预检和正式迁移都会显示入站编号，可输入单个编号、逗号列表或范围，只转换需要的节点。全量迁移还会单独询问是否自动停止占用目标端口的 `s-ui`/`sing-box`；脚本不会停止无法识别的进程，也不会绕过端口占用检查。原来的 `singbox-to-xray deploy ...` 参数式命令继续保留，适合自动化执行。
 
 也可以直接克隆运行：
 
@@ -94,6 +94,22 @@ sudo singbox-to-xray deploy \
 
 新版 S-UI 把入站保存在数据库中，并由 S-UI 进程动态组装 sing-box 配置。单独检查 `/usr/local/etc/sing-box/config.json` 不能证明其中包含 S-UI 节点。
 
+菜单“查看数据源与可迁移入站”会把只读来源与当前 Xray 配置进行比较，并分成“可迁移”“已存在于 Xray”“冲突”和“不支持或无效”四组。S-UI 数据库会继续保留原始入站作为回滚依据，但同 tag、同协议、同端口的 Xray 入站不会再次列入“可迁移”；最近一次状态文件还能标明原 S-UI client 是否已经删除。
+
+## 选择部分入站
+
+菜单预检、隔离测试和正式迁移都支持编号多选：
+
+```text
+输入 2       只选择第 2 个
+输入 1,3     选择第 1、3 个
+输入 1-3     选择第 1 到第 3 个
+直接回车     选择全部可选入站
+输入 0       取消
+```
+
+参数模式继续使用可重复的 `--tag`，也可以使用 `--select-inbounds` 打开同一选择器。一次选择多个入站时，它们属于同一迁移批次，会一起写入状态并由一次 REVOKE 删除对应的原 client。上一批正式迁移尚未 REVOKE 或回滚时，脚本拒绝开始下一批，避免覆盖凭据指纹和回滚信息。
+
 ## 安全使用流程
 
 推荐直接打开菜单并选择 `2`，自动读取 S-UI 入站并做预检：
@@ -116,7 +132,7 @@ sudo singbox-to-xray deploy --strict --apply --stop-source-services
 
 ## 自动处理端口占用
 
-菜单选择 `5` 后会询问是否允许脚本自动停止来源服务。输入 `y` 后，脚本仅在端口所有者明确是 `sui`、`s-ui` 或 `sing-box` 时执行对应的 `systemctl stop`，确认端口已经释放后才写入 Xray。参数模式使用：
+菜单选择 `5` 后会询问是否允许脚本自动停止来源服务。只有选择全部来源入站时，输入 `y` 才会让脚本在端口所有者明确是 `sui`、`s-ui` 或 `sing-box` 时执行对应的 `systemctl stop`，确认端口已经释放后才写入 Xray。参数模式使用：
 
 ```bash
 sudo singbox-to-xray deploy --strict --apply --stop-source-services
@@ -134,6 +150,8 @@ Xray 配置尚未写入，请按下面步骤处理：
 ```
 
 停止 `s-ui` 会让面板暂时离线，但不会删除 S-UI 数据库或节点。脚本不会自动停止 Nginx 等无法确认用途的进程。如果停止来源服务后 Xray 部署失败，脚本会恢复 Xray 备份，并重新启动刚才由它停止的来源服务。不要使用 `--allow-active-port` 强行绕过同端口冲突。
+
+只选择部分入站时，脚本绝不会停止整个旧 Core。检测到所选端口仍被占用后，转换结果会留在当前进程内，脚本提示在另一个窗口或 S-UI 面板中只停用所选入站；完成后输入 `CHECK`。只有所选端口已经释放、且原本在线的未选端口仍在监听，脚本才会继续写入 Xray。若停止了整个旧 Core，检查会失败且 Xray 配置不会写入。
 
 ## 迁移完成后的主控操作
 
@@ -232,9 +250,10 @@ sudo singbox-to-xray deploy \
 - 保留 `api`、`stats`、`policy`、`metrics`、路由和出站。
 - 写盘前必须通过 `xray run -test -config`。
 - 每次部署创建 root-only 备份和状态文件。
+- 上一批尚未 REVOKE 或回滚时拒绝覆盖状态文件。
 - 使用同目录临时文件和 `os.replace` 原子写入。
 - Xray 启动失败或端口未监听时自动恢复备份。
-- 经确认后可自动停止 `s-ui`/`sing-box`；部署失败或显式回滚时自动重新启动来源服务。
+- 全量迁移经确认后可自动停止 `s-ui`/`sing-box`；部分迁移只允许用户停用所选入站。
 - 默认拒绝 tag、端口碰撞及非 Xray 进程占用目标端口。
 - 不在日志中输出 UUID、密码、证书私钥或 REALITY 密钥。
 - `--notify-master` 只有收到主控返回的实际 `node_tags` 后才算成功。
