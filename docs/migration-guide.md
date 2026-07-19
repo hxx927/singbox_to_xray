@@ -491,7 +491,7 @@ sudo python3 singbox_to_xray.py deploy --apply --stop-source-services
 sudo singbox-to-xray revoke-source-clients
 ```
 
-也可以在 `sudo s-x` 中选择 `6` 并输入 `REVOKE`。该步骤只修改 Agent 机器当前 Xray 的 `settings.clients`/`settings.accounts`，不修改节点管理中的基础 UUID、节点 ID、套餐绑定或主控数据。脚本只删除迁移时记录的源 client 指纹，先备份并运行 `xray -test`；没有检测到替代 client 时会拒绝写盘。旧 `0.4.0` 生成的状态文件也会从原 S-UI 数据库回填指纹。
+也可以在 `sudo s-x` 中选择 `6` 并输入 `REVOKE`。该步骤只修改 Agent 机器当前 Xray 的 `settings.clients`/`settings.accounts`，不修改节点管理中的基础 UUID、节点 ID、套餐绑定或主控数据。删除前脚本会按入站报告 client 总数、原 S-UI/sing-box 数量、miaomiaowuX 套餐用户数量和用户名，以及管理员/其他 client 数量和标签；统计不会显示 UUID 或密码。套餐用户依据 `用户名__入站tag` 约定识别，其余 client 归入“管理员/其他”。脚本只删除迁移时记录的源 client 指纹，先备份并运行 `xray -test`；没有检测到替代 client 时会拒绝写盘。旧 `0.4.0` 生成的状态文件也会从原 S-UI 数据库回填指纹。
 
 吊销成功后脚本会输出 `jq` 命令，列出相应 inbound 中剩余 client 的标签和凭据。在服务器本地找到管理员 client（例如 `黑西西`），复制其 UUID；然后到“节点管理”打开同 tag 节点的 Clash 配置详情，只把 `uuid` 替换为管理员 UUID。不要删除 Xray 入站或删除节点后重新扫描，否则 Agent 会扫描不到该业务入站；保存节点后更新管理员订阅并验证真实连接。
 

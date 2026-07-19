@@ -162,7 +162,7 @@ Xray 配置尚未写入，请按下面步骤处理：
 sudo singbox-to-xray revoke-source-clients
 ```
 
-或在 `sudo s-x` 中选择 `6` 并输入 `REVOKE`。脚本会先确认当前 inbound 仍有至少一个替代 client，创建吊销前备份，通过 `xray -test` 后才原子写入并重启 Xray。它只删除迁移时记录的原 S-UI client，不修改 miaomiaowuX 节点管理、套餐绑定或主控数据。
+或在 `sudo s-x` 中选择 `6` 并输入 `REVOKE`。实际删除前，脚本会按 inbound 显示 client 总数，以及原 S-UI/sing-box、miaomiaowuX 套餐用户、管理员/其他 client 的数量和标签；不会显示 UUID 或密码。套餐用户按 `用户名__入站tag` 标签识别，无法按该规则识别的 client 会归入“管理员/其他”。脚本还会确认当前 inbound 仍有至少一个替代 client，创建吊销前备份，通过 `xray -test` 后才原子写入并重启 Xray。它只删除迁移时记录的原 S-UI client，不修改 miaomiaowuX 节点管理、套餐绑定或主控数据。
 
 REVOKE 成功后，脚本会按迁移 tag 输出一条 `jq` 命令，用于在服务器本地列出剩余 client 的标签和凭据。找到管理员 client（例如 `黑西西`）后，在“节点管理”打开同 tag 节点的 Clash 配置详情：VLESS/VMess 只替换 `uuid`，Trojan/Hysteria 只替换 `password`，其他字段不变。不要删除 Xray 入站，也不要删除节点后重新扫描。保存后更新管理员订阅并做真实连接测试；套餐用户节点无需修改。
 

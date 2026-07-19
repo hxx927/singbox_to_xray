@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -1263,6 +1263,90 @@ def source_credential_records(inbounds: Iterable[dict[str, Any]]) -> dict[str, d
     return records
 
 
+def _client_display_label(client: Any) -> str:
+    if not isinstance(client, dict):
+        return "<unlabeled>"
+    for key in ("email", "user", "name"):
+        value = nonempty_string(client.get(key))
+        if value:
+            return value
+    return "<unlabeled>"
+
+
+def _summarize_client_labels(labels: Iterable[str], limit: int = 8) -> str:
+    values = sorted(set(labels))
+    if not values:
+        return "无"
+    visible = values[:limit]
+    summary = "、".join(visible)
+    if len(values) > limit:
+        summary += f"，另有 {len(values) - limit} 个"
+    return summary
+
+
+def client_inventory_report(config: dict[str, Any], records: dict[str, Any]) -> str:
+    """Describe migrated inbound clients without revealing their credentials."""
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list):
+        return ""
+    by_tag = {
+        nonempty_string(inbound.get("tag")): inbound
+        for inbound in inbounds
+        if isinstance(inbound, dict) and nonempty_string(inbound.get("tag"))
+    }
+    lines = ["", "Xray client 现状（不显示 UUID/密码）："]
+    reported = False
+    for tag, raw_record in sorted(records.items()):
+        if not isinstance(tag, str) or not isinstance(raw_record, dict):
+            continue
+        inbound = by_tag.get(tag)
+        if not isinstance(inbound, dict):
+            continue
+        protocol = nonempty_string(raw_record.get("protocol")).lower()
+        container = nonempty_string(raw_record.get("container"))
+        raw_fingerprints = raw_record.get("fingerprints")
+        if not isinstance(raw_fingerprints, list):
+            continue
+        fingerprints = {
+            value
+            for value in raw_fingerprints
+            if isinstance(value, str) and value
+        }
+        settings = inbound.get("settings")
+        if not isinstance(settings, dict) or not isinstance(settings.get(container), list):
+            continue
+
+        source_labels: list[str] = []
+        package_users: list[str] = []
+        other_labels: list[str] = []
+        entries = settings[container]
+        package_suffix = f"__{tag}"
+        for entry in entries:
+            label = _client_display_label(entry)
+            fingerprint = client_credential_fingerprint(protocol, entry)
+            if fingerprint and fingerprint in fingerprints:
+                source_labels.append(label)
+            elif label.endswith(package_suffix) and len(label) > len(package_suffix):
+                package_users.append(label[: -len(package_suffix)])
+            else:
+                other_labels.append(label)
+
+        remaining = len(entries) - len(source_labels)
+        lines.extend(
+            [
+                f"- {tag}：共 {len(entries)} 个 client",
+                f"  原 S-UI/sing-box：{len(source_labels)} 个",
+                "  miaomiaowuX 套餐用户："
+                f"{len(package_users)} 个（{_summarize_client_labels(package_users)}）",
+                "  miaomiaowuX 管理员/其他："
+                f"{len(other_labels)} 个（{_summarize_client_labels(other_labels)}）",
+                f"  REVOKE 后预计保留：{remaining} 个",
+            ]
+        )
+        reported = True
+    return "\n".join(lines) if reported else ""
+
+
 def recover_legacy_source_credential_records(
     state: dict[str, Any], xray_bin: str
 ) -> dict[str, dict[str, Any]]:
@@ -1649,6 +1733,9 @@ def command_revoke_source_clients(args: argparse.Namespace) -> int:
         raise MigrationError(f"invalid migration state: {state_path}")
     config_path = Path(config_value)
     current = load_json(config_path)
+    inventory = client_inventory_report(current, records)
+    if inventory:
+        print(inventory, file=sys.stderr)
     candidate, removed = remove_recorded_source_clients(current, records)
     if not removed:
         log("OK", "recorded source clients are already absent; no configuration change was needed")
