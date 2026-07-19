@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -1048,6 +1049,37 @@ def post_migration_guidance(*, sync_confirmed: bool, stopped_services: Iterable[
     return "\n".join(lines)
 
 
+def manual_admin_node_guidance(config_path: Path, tags: Iterable[str]) -> str:
+    lines = [
+        "",
+        "管理员节点手动切换：",
+        "REVOKE 只删除 Xray 中的原 S-UI client，不会修改 miaomiaowuX 节点管理。",
+        "请在服务器本地运行下面的命令，第一列是 client 标签，第二列是对应凭据：",
+    ]
+    jq_filter = (
+        '.inbounds[] | select(.tag == $tag) | .settings.clients[] | '
+        '[(.email // .user // "<unlabeled>"), '
+        '(.id // .password // .auth // .pass // "<no-credential>")] | @tsv'
+    )
+    for tag in sorted(set(tags)):
+        command = (
+            f"sudo jq -r --arg tag {shlex.quote(tag)} "
+            f"{shlex.quote(jq_filter)} {shlex.quote(str(config_path))}"
+        )
+        lines.extend([f"- {tag}：", f"  {command}"])
+    lines.extend(
+        [
+            "找到管理员 client（例如 黑西西）后，复制它对应的第二列值。",
+            "在 miaomiaowuX「节点管理」中打开同 tag 节点的 Clash 配置详情：",
+            "- VLESS/VMess：只把 uuid 改为管理员 client 的值。",
+            "- Trojan/Hysteria：只把 password 改为管理员 client 的值。",
+            "不要删除 Xray 入站，也不要删除后重新扫描节点；其他 server、port、Reality 和 tag 字段保持不变。",
+            "保存后更新管理员订阅并做真实连接测试；套餐用户节点无需修改。",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def wait_for_scan_result(started_at: dt.datetime, expected_count: int, timeout: int = 25) -> bool:
     log_path = Path("/var/log/mmw-agent/mmw-agent.log")
     deadline = time.monotonic() + timeout
@@ -1684,7 +1716,11 @@ def command_revoke_source_clients(args: argparse.Namespace) -> int:
     log("WARN", f"backup {backup} still contains the revoked credentials")
     print(
         "原 S-UI client 已从当前 Xray 配置删除。\n"
-        "请分别真实连接测试：原 S-UI 节点应失败，Xray 管理员节点和用户套餐节点应正常。",
+        "原 S-UI 节点应失败；用户套餐节点应保持正常。",
+        file=sys.stderr,
+    )
+    print(
+        manual_admin_node_guidance(config_path, removed),
         file=sys.stderr,
     )
     return 0

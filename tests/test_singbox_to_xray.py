@@ -281,6 +281,17 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("TCPing", message)
         self.assertIn("没有修改其开机启动状态", message)
 
+    def test_manual_admin_node_guidance_prints_safe_jq_command(self):
+        message = converter.manual_admin_node_guidance(
+            Path("/usr/local/etc/xray/config.json"), ["vless-50965"]
+        )
+
+        self.assertIn("jq -r --arg tag vless-50965", message)
+        self.assertIn("黑西西", message)
+        self.assertIn("只把 uuid", message)
+        self.assertIn("不要删除 Xray 入站", message)
+        self.assertIn("套餐用户节点无需修改", message)
+
     def test_deploy_stops_sui_and_prints_manual_sync_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
