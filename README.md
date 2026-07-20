@@ -2,7 +2,7 @@
 
 将 S-UI 生成的 sing-box 入站转换为 Xray 入站，并安全合并到 miaomiaowuX Agent 管理的 Xray 配置。支持直接读取新版 S-UI SQLite 数据库，不依赖另一个 sing-box 安装留下的 `config.json`。
 
-脚本只使用 Python 标准库，默认支持预检、备份、原子写入、Xray 重启检查、Agent 上报、主控节点同步确认和一键回滚。
+脚本只使用 Python 标准库，默认支持预检、备份、原子写入、Xray 重启检查、失败自动恢复、Agent 上报和主控节点同步确认。
 
 ## 支持范围
 
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/hxx927/singbox_to_xray/main/install
 安装器同时创建短命令 `/usr/local/bin/s-x`。root 用户直接输入 `s-x`，普通用户输入 `sudo s-x`，即可打开中文交互菜单：
 
 ```text
-singbox_to_xray 0.4.4
+singbox_to_xray 0.4.5
 ========================================
   1. 查看数据源与可迁移入站
   2. 安全预检（推荐，不写入）
@@ -36,13 +36,12 @@ singbox_to_xray 0.4.4
   4. 隔离端口预检
   5. 正式迁移到 Xray（可自动停止旧 Core）
   6. 删除原 S-UI client（需先确认新节点正常）
-  7. 回滚最近一次迁移
-  8. 显示命令帮助
+  7. 显示命令帮助
   0. 退出
 ========================================
 ```
 
-正式迁移必须手动输入 `APPLY`，删除旧 client 必须输入 `REVOKE`，回滚必须输入 `ROLLBACK`。预检和正式迁移都会显示入站编号，可输入单个编号、逗号列表或范围，只转换需要的节点。全量迁移还会单独询问是否自动停止占用目标端口的 `s-ui`/`sing-box`；脚本不会停止无法识别的进程，也不会绕过端口占用检查。原来的 `singbox-to-xray deploy ...` 参数式命令继续保留，适合自动化执行。
+正式迁移必须手动输入 `APPLY`，删除旧 client 必须输入 `REVOKE`。预检和正式迁移都会显示入站编号，可输入单个编号、逗号列表或范围，只转换需要的节点。全量迁移还会单独询问是否自动停止占用目标端口的 `s-ui`/`sing-box`；脚本不会停止无法识别的进程，也不会绕过端口占用检查。原来的 `singbox-to-xray deploy ...` 参数式命令继续保留，适合自动化执行。
 
 也可以直接克隆运行：
 
@@ -94,7 +93,7 @@ sudo singbox-to-xray deploy \
 
 新版 S-UI 把入站保存在数据库中，并由 S-UI 进程动态组装 sing-box 配置。单独检查 `/usr/local/etc/sing-box/config.json` 不能证明其中包含 S-UI 节点。
 
-菜单“查看数据源与可迁移入站”会把只读来源与当前 Xray 配置进行比较，并分成“可迁移”“已存在于 Xray”“冲突”和“不支持或无效”四组。S-UI 数据库会继续保留原始入站作为回滚依据，但同 tag、同协议、同端口的 Xray 入站不会再次列入“可迁移”；最近一次状态文件还能标明原 S-UI client 是否已经删除。
+菜单“查看数据源与可迁移入站”会把只读来源与当前 Xray 配置进行比较，并分成“可迁移”“已存在于 Xray”“冲突”和“不支持或无效”四组。S-UI 数据库会继续保留原始入站，但同 tag、同协议、同端口的 Xray 入站不会再次列入“可迁移”；最近一次状态文件还能标明原 S-UI client 是否已经删除。
 
 ## 选择部分入站
 
@@ -108,7 +107,7 @@ sudo singbox-to-xray deploy \
 输入 0       取消
 ```
 
-参数模式继续使用可重复的 `--tag`，也可以使用 `--select-inbounds` 打开同一选择器。一次选择多个入站时，它们属于同一迁移批次，会一起写入状态并由一次 REVOKE 删除对应的原 client。上一批正式迁移尚未 REVOKE 或回滚时，脚本拒绝开始下一批，避免覆盖凭据指纹和回滚信息。
+参数模式继续使用可重复的 `--tag`，也可以使用 `--select-inbounds` 打开同一选择器。一次选择多个入站时，它们属于同一迁移批次，会一起写入状态并由一次 REVOKE 删除对应的原 client。上一批正式迁移尚未 REVOKE、且对应 tag 仍存在于 Xray 时，脚本拒绝开始下一批，避免覆盖凭据指纹和备份信息；手动删除这些 Xray 入站后会自动放行。
 
 ## 安全使用流程
 
@@ -210,15 +209,11 @@ sudo singbox-to-xray deploy \
   --apply --notify-master
 ```
 
-## 回滚
+## 手动撤销迁移
 
-恢复最近一次部署前的 Xray 配置；如果正式迁移曾由脚本停止来源服务，回滚会同时重新启动该服务：
+脚本不提供显式回滚命令。需要撤销时，在 miaomiaowuX 删除已转换节点，并确认 Agent 当前 Xray 配置中的同 tag 入站已经删除、目标端口已经释放，然后重新启动 S-UI/sing-box。只删除主控节点列表但保留 Xray 入站不会释放端口，旧 Core 也无法恢复监听。
 
-```bash
-sudo singbox-to-xray rollback --notify-master
-```
-
-成功时状态为 `rolled_back_synced`。主控只会删除属于当前 Agent 服务器、且已确认不再存在于 Xray 入站中的 tag。
+完成后重新执行“扫描远程服务 → 接受 Agent 现状”。下次正式迁移会检查上一批 tag；它们已经不在 Xray 配置中时，旧状态文件不会阻止新迁移。部署过程本身失败时，脚本仍会自动恢复部署前的 Xray 备份并重新启动由它停止的来源服务。
 
 ## 只转换
 
@@ -250,7 +245,7 @@ sudo singbox-to-xray deploy \
 - 保留 `api`、`stats`、`policy`、`metrics`、路由和出站。
 - 写盘前必须通过 `xray run -test -config`。
 - 每次部署创建 root-only 备份和状态文件。
-- 上一批尚未 REVOKE 或回滚时拒绝覆盖状态文件。
+- 上一批尚未 REVOKE、且对应 tag 仍在 Xray 时拒绝覆盖状态文件。
 - 使用同目录临时文件和 `os.replace` 原子写入。
 - Xray 启动失败或端口未监听时自动恢复备份。
 - 全量迁移经确认后可自动停止 `s-ui`/`sing-box`；部分迁移只允许用户停用所选入站。
@@ -265,7 +260,6 @@ sudo singbox-to-xray deploy \
 - `scan_result` 回调异步处理，避免 WebSocket 读取循环等待同连接的 RPC reply。
 - `POST /api/remote/sync-nodes`，使用 Agent 配置中的服务器 token 鉴权。
 - 同步后返回当前服务器实际持久化的 `node_tags`。
-- 回滚时只清理当前服务器中已从 Agent 入站消失的 tag。
 
 当前正式版本只有管理员界面/MCP 使用的 `/api/admin/remote/sync-nodes` 时，脚本无法使用 Agent token 调用它。此时 404 会被视为“Xray 迁移成功、需要手动同步”：脚本正常退出、记录 `manual_sync_required`，并提示到服务管理扫描远程服务和接受 Agent 现状。
 

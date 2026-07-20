@@ -286,6 +286,7 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         action.assert_called_once_with(["deploy", "--strict", "--select-inbounds"])
         self.assertIn("安全预检", output.getvalue())
+        self.assertNotIn("回滚最近一次迁移", output.getvalue())
 
     def test_menu_cancelled_apply_does_not_run_action(self):
         with mock.patch.object(converter.sys.stdin, "isatty", return_value=True), mock.patch.object(
@@ -411,6 +412,33 @@ class ConverterTests(unittest.TestCase):
                 encoding="utf-8",
             )
             converter.ensure_no_pending_migration(state_file)
+
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "status": "rolled_back_master_sync_failed",
+                        "deployed_tags": ["vless-main"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            converter.ensure_no_pending_migration(state_file)
+
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "status": "manual_sync_required",
+                        "deployed_tags": ["vless-main"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            converter.ensure_no_pending_migration(state_file, {"inbounds": []})
+
+    def test_rollback_command_is_not_available(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                converter.build_parser().parse_args(["rollback"])
 
     def test_post_migration_guidance_describes_manual_acceptance(self):
         message = converter.post_migration_guidance(
@@ -921,50 +949,6 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(state["status"], "source_clients_revoked")
         self.assertEqual(state["source_clients_revoked"], {"vless-main": 0})
-
-    def test_rollback_restarts_source_service_stopped_by_deploy(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            xray_config = root / "xray.json"
-            backup = root / "xray.backup.json"
-            state_file = root / "state.json"
-            xray_config.write_text(
-                '{"inbounds": [{"tag": "ss-main", "port": 12315}]}\n', encoding="utf-8"
-            )
-            backup.write_text('{"inbounds": []}\n', encoding="utf-8")
-            state_file.write_text(
-                json.dumps(
-                    {
-                        "xray_config": str(xray_config),
-                        "backup": str(backup),
-                        "xray_service": "xray",
-                        "agent_service": "mmw-agent",
-                        "agent_config": "/etc/mmw-agent/config.yaml",
-                        "deployed_tags": ["ss-main"],
-                        "stopped_source_services": ["s-ui"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            args = converter.build_parser().parse_args(
-                ["rollback", "--state-file", str(state_file)]
-            )
-            with mock.patch.object(converter.os, "geteuid", return_value=0), mock.patch.object(
-                converter.os, "chown"
-            ), mock.patch.object(converter, "service_active", return_value=True), mock.patch.object(
-                converter, "service_action"
-            ) as service_action, contextlib.redirect_stderr(io.StringIO()):
-                exit_code = converter.command_rollback(args)
-
-            state = json.loads(state_file.read_text(encoding="utf-8"))
-            restored = json.loads(xray_config.read_text(encoding="utf-8"))
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(restored, {"inbounds": []})
-        self.assertEqual(state["status"], "rolled_back")
-        self.assertEqual(state["restarted_source_services"], ["s-ui"])
-        service_action.assert_any_call("xray", "restart")
-        service_action.assert_any_call("s-ui", "start")
 
     def test_converts_shadowsocks_and_socks(self):
         source = {

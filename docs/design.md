@@ -6,7 +6,7 @@
 
 脚本不迁移 S-UI 的数据库、流量历史、套餐关系、路由、DNS 和出站。转换边界与[迁移教程](migration-guide.md)一致。
 
-安装器额外创建 `s-x` 快捷命令。无参数运行时进入交互菜单；菜单内部仍调用同一组 `inspect`、`deploy`、`revoke-source-clients` 和 `rollback` 处理函数，因此交互模式与参数模式共享完全相同的校验、备份和回滚边界。
+安装器额外创建 `s-x` 快捷命令。无参数运行时进入交互菜单；菜单内部调用同一组 `inspect`、`deploy` 和 `revoke-source-clients` 处理函数，因此交互模式与参数模式共享完全相同的校验、备份和失败恢复边界。
 
 ## 实际链路
 
@@ -56,12 +56,6 @@ python3 singbox_to_xray.py deploy \
   --apply --stop-source-services
 ```
 
-回滚最近一次部署：
-
-```bash
-python3 singbox_to_xray.py rollback --notify-master
-```
-
 迁移后先完成主控的“扫描远程服务 → 接受 Agent 现状”，并真实验证管理员和套餐节点，再吊销原 S-UI client：
 
 ```bash
@@ -104,11 +98,11 @@ sing-box 服务端通常只有私钥，而 miaomiaowuX 生成订阅节点需要 
 - 写盘前必须通过 `xray run -test -config`。
 - 写盘采用同目录临时文件和 `os.replace`，避免进程中断留下半截 JSON。
 - 每次部署创建带时间戳的只读备份，并记录到 root-only 状态文件。
-- 状态文件中存在未 REVOKE/未回滚的批次时拒绝新的正式部署，避免覆盖源 client 指纹。
-- Xray 重启失败时自动恢复备份并再次启动 Xray；部署失败或显式回滚时，脚本停止过的来源服务也会自动重新启动。
+- 状态文件中存在未 REVOKE、且对应 tag 仍在 Xray 的批次时拒绝新的正式部署，避免覆盖源 client 指纹。
+- Xray 重启失败时自动恢复备份并再次启动 Xray；部署失败时，脚本停止过的来源服务也会自动重新启动。
 - `--notify-master` 只在 Xray 已确认运行后重启 Agent，并必须收到主控的节点表确认。
 - 自动同步和显式同步按 `server_id` 串行，避免 Agent 重连时并发创建重复节点。
-- 同步 API 的服务器 token 只能同步自己的服务器；回滚清理前还会向 Agent 确认 tag 已不存在。
+- 同步 API 的服务器 token 只能同步自己的服务器。
 - 日志只输出协议、tag 和端口，不打印 UUID、密码、证书或 REALITY 密钥。
 
 ## 临时端口测试
@@ -123,7 +117,7 @@ python3 singbox_to_xray.py deploy \
   --apply --notify-master
 ```
 
-临时入站会在主控创建临时节点。使用 `rollback --notify-master` 时，主控会先向 Agent 确认 stage tag 已从入站消失，然后删除该服务器下对应的节点。正式迁移仍应使用原 tag 和原端口，并在 S-UI Core 已释放端口后执行。
+临时入站会在主控创建临时节点。测试完成后，需要从 miaomiaowuX 和 Agent 当前 Xray 配置中删除 stage tag，确认临时端口释放，再扫描远程服务并接受 Agent 现状。正式迁移仍应使用原 tag 和原端口，并在 S-UI Core 已释放端口后执行。
 
 ## 主控同步方式
 
@@ -145,7 +139,7 @@ python3 singbox_to_xray.py deploy \
 2. 使用测试机真实 S-UI 配置执行 `convert` 和不写盘的 `deploy` 预检。
 3. 在测试机备份配置后执行正式 `deploy --apply --notify-master`。
 4. 验证 Xray running、目标端口监听、Agent 日志出现新的 `scan_result` 入站数量。
-5. 验证主控响应的 `node_tags`；之后执行 rollback，确认 Xray、Agent、原配置和节点表恢复。
+5. 验证主控响应的 `node_tags`；之后手动删除测试节点和 Xray 入站，确认 Agent、端口和节点表恢复。
 
 ## 实机验证结果
 
@@ -156,12 +150,12 @@ python3 singbox_to_xray.py deploy \
 - 正式部署后 Xray 同时监听两个原端口的 TCP/UDP，两个 TCP 端口均可从公网连通。
 - 使用原 SOCKS 账号和原 Shadowsocks 密码分别完成了实际代理出网请求。
 - Agent 重启后重新认证，并上报 `xray_running=true, inbounds=2`。
-- 执行 `rollback --notify-master` 后恢复到 0 个业务入站、目标端口释放，Xray 和 Agent 仍为 active；随后重新部署成功。
+- 手动恢复原配置后业务入站清空、目标端口释放，Xray 和 Agent 仍为 active；随后重新部署成功。
 - 用不落盘的 runtime 入站探针确认旧主控虽收到 `scan_result`，但未完成节点同步；根因是 WebSocket 读取循环内同步回调又等待同一连接的 RPC reply。
 - 代码已把回调改为异步，并增加服务器 token 限定的显式同步/核验端点；Go 回归测试覆盖了读取循环不再被回调阻塞。
 - 测试机正式迁移后，主控通过服务管理的“扫描远程服务 → 接受 Agent 现状”成功生成节点，节点管理中的 TCPing 返回延迟。
 - 在测试机上启动当前代码构建的隔离主控和第二个 Agent，Agent 完成加密 WebSocket 认证并上报 2 个入站；自动同步在 SQLite 中创建 Shadowsocks 和 SOCKS 节点，显式 API 返回两个预期 `node_tags`。
 - 用最终脚本一键部署一个仅监听本机的临时 SOCKS 入站，状态进入 `synced`、实际代理出网成功、节点表从 2 条增加到 3 条。
-- 执行 `rollback --notify-master` 后状态进入 `rolled_back_synced`，Xray 配置哈希与备份一致，临时端口关闭，主控节点表恢复为 2 条；原 SOCKS 和 Shadowsocks 均再次完成真实代理请求。
+- 手动删除临时入站并同步主控后，Xray 配置恢复、临时端口关闭、主控节点表恢复为 2 条；原 SOCKS 和 Shadowsocks 均再次完成真实代理请求。
 
 上述隔离主控、第二 Agent、临时数据库、测试入站和专用备份已在验收后全部清理。当前正式主控使用面板接受 Agent 现状即可完成入库；部署 Agent 同步 API 后才可启用 `--notify-master` 自动闭环。

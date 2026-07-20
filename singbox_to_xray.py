@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 DEFAULT_SINGBOX_CONFIG = "/usr/local/etc/sing-box/config.json"
 DEFAULT_SUI_DB = "/usr/local/s-ui/db/s-ui.db"
 DEFAULT_XRAY_CONFIG = "/usr/local/etc/xray/config.json"
@@ -1379,28 +1379,45 @@ def wait_for_partial_port_release(
 RESOLVED_MIGRATION_STATES = {
     "source_clients_revoked",
     "auto_rolled_back",
-    "rolled_back",
-    "rolled_back_synced",
 }
 
 
-def ensure_no_pending_migration(state_path: Path) -> None:
+def ensure_no_pending_migration(
+    state_path: Path, xray_config: dict[str, Any] | None = None
+) -> None:
     if not state_path.exists():
         return
     state = load_json(state_path)
     status = nonempty_string(state.get("status"))
-    if status in RESOLVED_MIGRATION_STATES:
+    if status in RESOLVED_MIGRATION_STATES or status.startswith("rolled_back"):
         return
     deployed_tags = [
         tag for tag in state.get("deployed_tags", []) if isinstance(tag, str) and tag
     ]
     if not status and not deployed_tags:
         return
+    if deployed_tags and isinstance(xray_config, dict):
+        current_inbounds = xray_config.get("inbounds")
+        current_tags = (
+            {
+                nonempty_string(inbound.get("tag"))
+                for inbound in current_inbounds
+                if isinstance(inbound, dict) and nonempty_string(inbound.get("tag"))
+            }
+            if isinstance(current_inbounds, list)
+            else set()
+        )
+        if not set(deployed_tags) & current_tags:
+            log(
+                "OK",
+                "previous migration tags are absent from Xray; treating it as manually removed",
+            )
+            return
     detail = ", ".join(deployed_tags) or "<unknown>"
     raise MigrationError(
         "上一批正式迁移尚未完成，拒绝覆盖状态文件："
         f"status={status or '<unknown>'}, tags={detail}。"
-        "请先执行菜单 6 完成 REVOKE，或执行菜单 7 回滚。"
+        "请先执行菜单 6 完成 REVOKE；如已手动撤销，请确认这些 tag 已从 Xray 配置删除并恢复来源服务。"
     )
 
 
@@ -2005,7 +2022,7 @@ def command_deploy(args: argparse.Namespace) -> int:
         raise MigrationError("deploy --apply must run as root")
 
     state_path = Path(args.state_file)
-    ensure_no_pending_migration(state_path)
+    ensure_no_pending_migration(state_path, current)
     desired_ports = {int(inbound["port"]) for inbound in result.inbounds}
     source_ports = source_ports_by_tag(source.config)
     selected_tags = selected_source_tags(source.config, options)
@@ -2294,86 +2311,6 @@ def command_revoke_source_clients(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_rollback(args: argparse.Namespace) -> int:
-    if os.geteuid() != 0:
-        raise MigrationError("rollback must run as root")
-    state_path = Path(args.state_file)
-    state = load_json(state_path)
-    config_value = nonempty_string(state.get("xray_config"))
-    backup_value = nonempty_string(state.get("backup"))
-    if not config_value or not backup_value:
-        raise MigrationError(f"invalid migration state: {state_path}")
-    config_path = Path(config_value)
-    backup_path = Path(backup_value)
-    xray_service = args.xray_service or state.get("xray_service", "xray")
-    agent_service = args.agent_service or state.get("agent_service", "mmw-agent")
-    agent_config = args.agent_config or state.get("agent_config", DEFAULT_AGENT_CONFIG)
-    deployed_tags = [tag for tag in state.get("deployed_tags", []) if isinstance(tag, str) and tag]
-    stopped_source_services = [
-        service
-        for service in state.get("stopped_source_services", [])
-        if service in {"s-ui", "sing-box"}
-    ]
-    restore_backup(config_path, backup_path, xray_service)
-    for service in stopped_source_services:
-        try:
-            service_action(service, "start")
-        except MigrationError as exc:
-            state["status"] = "rolled_back_source_restart_failed"
-            state["rollback_error"] = str(exc)
-            write_state(state_path, state)
-            raise MigrationError(
-                f"Xray backup was restored, but source service {service} could not be restarted: {exc}"
-            ) from exc
-        log("OK", f"restarted source service {service} after rollback")
-    state["status"] = "rolled_back"
-    state["rolled_back_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    state["restarted_source_services"] = stopped_source_services
-    write_state(state_path, state)
-    log("OK", f"restored Xray config from {backup_path}")
-    if args.notify_master:
-        started_at = dt.datetime.now()
-        service_action(agent_service, "restart")
-        if not service_active(agent_service):
-            raise MigrationError("rollback succeeded, but mmw-agent did not become active")
-        restored = load_json(config_path)
-        expected_count = len([item for item in restored.get("inbounds", []) if item.get("tag") != "api"])
-        if not wait_for_scan_result(started_at, expected_count, args.scan_timeout):
-            raise MigrationError("rollback succeeded, but Agent scan_result was not observed")
-        log("OK", "Agent reported the restored Xray configuration")
-        restored_tags = [
-            item.get("tag")
-            for item in restored.get("inbounds", [])
-            if isinstance(item, dict) and item.get("tag") and item.get("tag") != "api"
-        ]
-        try:
-            sync_result = request_master_node_sync(
-                Path(agent_config),
-                expected_tags=restored_tags,
-                remove_absent_tags=deployed_tags,
-                timeout=args.master_sync_timeout,
-            )
-        except MigrationError as exc:
-            state["status"] = "rolled_back_master_sync_failed"
-            state["master_sync_error"] = str(exc)
-            write_state(state_path, state)
-            raise MigrationError(f"rollback succeeded, but master node cleanup was not confirmed: {exc}") from exc
-        node_tags = set(sync_result.get("node_tags", []))
-        stale = sorted((set(deployed_tags) - set(restored_tags)) & node_tags)
-        if stale:
-            state["status"] = "rolled_back_master_sync_failed"
-            state["master_sync_error"] = "stale node tags: " + ", ".join(stale)
-            write_state(state_path, state)
-            raise MigrationError("rollback succeeded, but stale master node tag(s) remain: " + ", ".join(stale))
-        state["status"] = "rolled_back_synced"
-        state["master_synced_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        state["node_tags"] = sync_result.get("node_tags", [])
-        state.pop("master_sync_error", None)
-        write_state(state_path, state)
-        log("OK", "master confirmed the restored node set")
-    return 0
-
-
 def menu_prompt(message: str) -> str:
     print(message, end="", flush=True)
     value = sys.stdin.readline()
@@ -2407,12 +2344,11 @@ singbox_to_xray {VERSION}
   4. 隔离端口预检
   5. 正式迁移到 Xray（可自动停止旧 Core）
   6. 删除原 S-UI client（需先确认新节点正常）
-  7. 回滚最近一次迁移
-  8. 显示命令帮助
+  7. 显示命令帮助
   0. 退出
 ========================================"""
             )
-            choice = menu_prompt("请选择 [0-8]：")
+            choice = menu_prompt("请选择 [0-7]：")
             if choice == "0":
                 print("已退出。")
                 return 0
@@ -2479,15 +2415,6 @@ singbox_to_xray {VERSION}
                     continue
                 run_menu_action(["revoke-source-clients"])
             elif choice == "7":
-                print("\n回滚会恢复最近一次部署前的 Xray 配置并重启 Xray。")
-                if menu_prompt("输入 ROLLBACK 继续，其他内容取消：") != "ROLLBACK":
-                    print("已取消回滚。")
-                    continue
-                command = ["rollback"]
-                if menu_prompt("回滚后通知 miaomiaowuX 主控？[y/N]：").lower() in {"y", "yes"}:
-                    command.append("--notify-master")
-                run_menu_action(command)
-            elif choice == "8":
                 print()
                 build_parser().print_help()
             else:
@@ -2607,15 +2534,6 @@ def build_parser() -> argparse.ArgumentParser:
     revoke_parser.add_argument("--xray-service")
     revoke_parser.set_defaults(handler=command_revoke_source_clients)
 
-    rollback_parser = subparsers.add_parser("rollback", help="restore the latest deployment backup")
-    rollback_parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
-    rollback_parser.add_argument("--notify-master", action="store_true")
-    rollback_parser.add_argument("--xray-service")
-    rollback_parser.add_argument("--agent-service")
-    rollback_parser.add_argument("--agent-config")
-    rollback_parser.add_argument("--scan-timeout", type=int, default=25)
-    rollback_parser.add_argument("--master-sync-timeout", type=int, default=45)
-    rollback_parser.set_defaults(handler=command_rollback)
     return parser
 
 
